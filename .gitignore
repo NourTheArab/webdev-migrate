@@ -1,0 +1,29 @@
+# Logs
+*.log
+/var/log/
+
+# Lock files
+*.lock
+/var/lock/
+
+# Backups (don't commit actual backup data)
+/srv/backups/
+
+# System files
+.DS_Store
+*~
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Temporary files
+tmp/
+temp/
