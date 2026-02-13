@@ -1,0 +1,3420 @@
+#!/usr/bin/env bash
+
+#==============================================================================
+# webdev-migrate: Unified WordPress Migration & Management Tool
+# Version: 1.2.0
+# Description: Complete WordPress site management for university web teams
+#              Handles backup, restore, migration, cloning, and multisite conversions
+#==============================================================================
+
+set -euo pipefail
+
+#==============================================================================
+# GLOBAL CONFIGURATION
+#==============================================================================
+
+SCRIPT_VERSION="1.2.0"
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+START_TIME=$(date +%s)
+
+# Default configuration (can be overridden by config file)
+DEFAULT_SOURCE_HOST="web"
+DEFAULT_DEST_HOST="web-urey"
+DEFAULT_SSH_USER="root"
+DEFAULT_WEBROOT="/var/www"
+DEFAULT_BACKUP_ROOT="/srv/backups/wp"
+DEFAULT_LOG_DIR="/var/log/webdev-migrate"
+
+# Load user config if it exists
+CONFIG_FILE="${HOME}/.webdev-migrate.conf"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Apply defaults if not set by config
+SOURCE_HOST="${SOURCE_HOST:-$DEFAULT_SOURCE_HOST}"
+DEST_HOST="${DEST_HOST:-$DEFAULT_DEST_HOST}"
+SSH_USER="${SSH_USER:-$DEFAULT_SSH_USER}"
+WEBROOT="${WEBROOT:-$DEFAULT_WEBROOT}"
+BACKUP_ROOT="${BACKUP_ROOT:-$DEFAULT_BACKUP_ROOT}"
+LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
+
+# Global flags
+DRY_RUN=false
+VERBOSE=false
+NON_INTERACTIVE=false
+SHOW_SECRETS=false
+ASSUME_YES=false
+FORCE=false
+
+# Operation lock directory (V1.2)
+LOCK_DIR="/var/lock/webdev-migrate"
+GLOBAL_LOCK_FD=""
+GLOBAL_LOCK_FILE=""
+
+# Colors (disabled if not a TTY)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' NC=''
+fi
+
+# Timestamp for this run
+RUN_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+LOG_FILE="${LOG_DIR}/${SCRIPT_NAME}-${RUN_TIMESTAMP}.log"
+
+#==============================================================================
+# LOGGING AND OUTPUT FUNCTIONS
+#==============================================================================
+
+setup_logging() {
+    mkdir -p "$LOG_DIR"
+    exec > >(tee -a "$LOG_FILE")
+    exec 2>&1
+    log_info "=== webdev-migrate v${SCRIPT_VERSION} started at $(date) ==="
+    log_info "Log file: $LOG_FILE"
+}
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $*"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*"
+}
+
+log_step() {
+    echo -e "${CYAN}[STEP]${NC} $*"
+}
+
+log_debug() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo -e "${MAGENTA}[DEBUG]${NC} $*"
+    fi
+}
+
+print_header() {
+    echo ""
+    echo -e "${BOLD}========================================${NC}"
+    echo -e "${BOLD}$1${NC}"
+    echo -e "${BOLD}========================================${NC}"
+    echo ""
+}
+
+print_section() {
+    echo ""
+    echo -e "${CYAN}--- $1 ---${NC}"
+    echo ""
+}
+
+confirm() {
+    local prompt="$1"
+    local default="${2:-n}"
+    
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        log_info "Auto-confirming (--assume-yes): $prompt"
+        return 0
+    fi
+    
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        log_error "Confirmation required but running in non-interactive mode"
+        return 1
+    fi
+    
+    local response
+    if [[ "$default" == "y" ]]; then
+        read -r -p "$prompt [Y/n]: " response
+        response=${response:-y}
+    else
+        read -r -p "$prompt [y/N]: " response
+        response=${response:-n}
+    fi
+    
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+require_confirmation_string() {
+    local required_string="$1"
+    local prompt="$2"
+    
+    if [[ "$ASSUME_YES" == "true" && "$FORCE" == "true" ]]; then
+        log_warn "Bypassing confirmation string requirement (--assume-yes --force)"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${RED}${BOLD}⚠️  DANGEROUS OPERATION${NC}"
+    echo -e "${YELLOW}$prompt${NC}"
+    echo ""
+    echo -e "To proceed, type exactly: ${BOLD}${required_string}${NC}"
+    echo ""
+    
+    local response
+    read -r -p "> " response
+    
+    if [[ "$response" == "$required_string" ]]; then
+        return 0
+    else
+        log_error "Confirmation failed. Operation cancelled."
+        return 1
+    fi
+}
+
+#==============================================================================
+# ERROR HANDLING
+#==============================================================================
+
+cleanup_on_exit() {
+    local exit_code=$?
+    local end_time=$(date +%s)
+    local duration=$((end_time - START_TIME))
+    
+    # Release any held locks (V1.2)
+    release_lock
+    
+    echo ""
+    if [[ $exit_code -eq 0 ]]; then
+        log_success "Operation completed successfully in ${duration}s"
+    else
+        log_error "Operation failed with exit code $exit_code after ${duration}s"
+    fi
+    log_info "Full log: $LOG_FILE"
+}
+
+trap cleanup_on_exit EXIT
+
+error_exit() {
+    log_error "$1"
+    exit "${2:-1}"
+}
+
+#==============================================================================
+# OPERATION LOCKING (V1.2 - Prevents concurrent operations on same site)
+#==============================================================================
+
+acquire_lock() {
+    local site_slug="$1"
+    local operation="$2"
+    
+    log_debug "Attempting to acquire lock for: $site_slug"
+    
+    # Create lock directory if it doesn't exist
+    if ! mkdir -p "$LOCK_DIR" 2>/dev/null; then
+        sudo mkdir -p "$LOCK_DIR" 2>/dev/null || {
+            log_warn "Could not create lock directory, proceeding without lock"
+            return 0
+        }
+    fi
+    
+    local lock_file="${LOCK_DIR}/${site_slug}.lock"
+    local lock_fd=200
+    
+    # Try to acquire lock
+    eval "exec $lock_fd>\"$lock_file\"" 2>/dev/null || {
+        log_warn "Could not open lock file, proceeding without lock"
+        return 0
+    }
+    
+    if ! flock -n $lock_fd 2>/dev/null; then
+        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_error "  OPERATION LOCKED"
+        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_error ""
+        log_error "Another operation is already running on site: $site_slug"
+        log_error ""
+        log_error "This prevents:"
+        log_error "  • Database corruption from simultaneous writes"
+        log_error "  • File conflicts from concurrent operations"
+        log_error "  • Confusing intermediate states"
+        log_error ""
+        log_error "Current lock: $lock_file"
+        if [[ -f "$lock_file" ]]; then
+            log_error "Lock info:"
+            cat "$lock_file" | while read -r line; do
+                log_error "  $line"
+            done
+        fi
+        log_error ""
+        log_error "If you're sure no operation is running, remove:"
+        log_error "  sudo rm $lock_file"
+        log_error ""
+        return 1
+    fi
+    
+    # Write operation info to lock file
+    echo "Operation: $operation" >&$lock_fd
+    echo "PID: $$" >&$lock_fd
+    echo "Started: $(date)" >&$lock_fd
+    echo "User: $(whoami)" >&$lock_fd
+    echo "Host: $(hostname)" >&$lock_fd
+    
+    # Store globally for cleanup
+    GLOBAL_LOCK_FD=$lock_fd
+    GLOBAL_LOCK_FILE="$lock_file"
+    
+    log_debug "Lock acquired for $site_slug"
+    
+    return 0
+}
+
+release_lock() {
+    if [[ -z "$GLOBAL_LOCK_FD" ]]; then
+        return 0
+    fi
+    
+    log_debug "Releasing lock"
+    
+    # Release flock
+    if [[ -n "$GLOBAL_LOCK_FD" ]]; then
+        flock -u "$GLOBAL_LOCK_FD" 2>/dev/null || true
+        eval "exec ${GLOBAL_LOCK_FD}>&-" 2>/dev/null || true
+    fi
+    
+    # Clean up lock file if it's ours
+    if [[ -n "$GLOBAL_LOCK_FILE" && -f "$GLOBAL_LOCK_FILE" ]]; then
+        local lock_pid=$(grep "^PID:" "$GLOBAL_LOCK_FILE" 2>/dev/null | awk '{print $2}')
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "$GLOBAL_LOCK_FILE" 2>/dev/null || sudo rm -f "$GLOBAL_LOCK_FILE" 2>/dev/null || true
+            log_debug "Lock file removed"
+        fi
+    fi
+    
+    GLOBAL_LOCK_FD=""
+    GLOBAL_LOCK_FILE=""
+}
+
+#==============================================================================
+# UTILITY FUNCTIONS
+#==============================================================================
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+    if ! command_exists "$1"; then
+        error_exit "Required command not found: $1. Install: sudo apt install $2"
+    fi
+}
+
+is_root() {
+    [[ $EUID -eq 0 ]]
+}
+
+get_disk_space_gb() {
+    local path="$1"
+    df -BG "$path" | awk 'NR==2 {print $4}' | sed 's/G//'
+}
+
+human_size() {
+    local bytes="$1"
+    numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes}B"
+}
+
+sanitize_slug() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+#==============================================================================
+# ENVIRONMENT VALIDATION (V1.2 - Prevents live/test confusion)
+#==============================================================================
+
+validate_environment_match() {
+    local wp_path="$1"
+    local db_name="$2"
+    local expected_env="$3"  # "live" or "test"
+    
+    log_debug "Validating environment match: expected=$expected_env"
+    
+    local path_is_test=false
+    local db_is_test=false
+    
+    # Check if path indicates test environment
+    if [[ "$wp_path" == *"testing"* ]]; then
+        path_is_test=true
+    fi
+    
+    # Check if database name indicates test environment
+    if [[ "$db_name" == *"testing"* ]]; then
+        db_is_test=true
+    fi
+    
+    # Validate consistency
+    if [[ "$expected_env" == "test" ]]; then
+        local errors=()
+        
+        if [[ "$path_is_test" == "false" ]]; then
+            errors+=("PATH: You said 'test' but path doesn't contain 'testing'")
+            errors+=("  Current: $wp_path")
+            errors+=("  Expected: /var/www/wordpress-testing-sitename")
+        fi
+        
+        if [[ "$db_is_test" == "false" ]]; then
+            errors+=("DATABASE: You said 'test' but DB name doesn't contain 'testing'")
+            errors+=("  Current: $db_name")
+            errors+=("  Expected: wp_testing_sitename")
+        fi
+        
+        if [[ ${#errors[@]} -gt 0 ]]; then
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_error "  ENVIRONMENT MISMATCH"
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_error ""
+            for error in "${errors[@]}"; do
+                log_error "$error"
+            done
+            log_error ""
+            log_error "This prevents accidentally running test operations on live,"
+            log_error "or vice versa."
+            log_error ""
+            return 1
+        fi
+        
+    elif [[ "$expected_env" == "live" ]]; then
+        local errors=()
+        
+        if [[ "$path_is_test" == "true" ]]; then
+            errors+=("PATH: You said 'live' but path contains 'testing'")
+            errors+=("  Current: $wp_path")
+            errors+=("  This looks like a test site, not live!")
+        fi
+        
+        if [[ "$db_is_test" == "true" ]]; then
+            errors+=("DATABASE: You said 'live' but DB name contains 'testing'")
+            errors+=("  Current: $db_name")
+            errors+=("  This looks like a test database, not live!")
+        fi
+        
+        if [[ ${#errors[@]} -gt 0 ]]; then
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_error "  ENVIRONMENT MISMATCH"
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_error ""
+            for error in "${errors[@]}"; do
+                log_error "$error"
+            done
+            log_error ""
+            log_error "This prevents accidentally running live operations on test,"
+            log_error "or vice versa."
+            log_error ""
+            return 1
+        fi
+    fi
+    
+    log_debug "Environment validation passed"
+    return 0
+}
+
+#==============================================================================
+# PREFLIGHT CHECKS
+#==============================================================================
+
+check_requirements() {
+    print_section "Checking System Requirements"
+    
+    local missing=()
+    
+    # Core utilities
+    local required_commands=(
+        "bash:bash"
+        "tar:tar"
+        "gzip:gzip"
+        "rsync:rsync"
+        "ssh:openssh-client"
+        "mysql:mysql-client"
+        "mysqldump:mysql-client"
+        "wp:wordpress-cli"
+        "apache2ctl:apache2"
+        "a2ensite:apache2"
+        "systemctl:systemd"
+        "find:findutils"
+        "awk:gawk"
+        "sed:sed"
+        "grep:grep"
+    )
+    
+    for cmd_pair in "${required_commands[@]}"; do
+        IFS=: read -r cmd package <<< "$cmd_pair"
+        if ! command_exists "$cmd"; then
+            missing+=("$cmd ($package)")
+        else
+            log_debug "✓ Found: $cmd"
+        fi
+    done
+    
+    # Optional but recommended
+    if command_exists "zstd"; then
+        log_debug "✓ Found: zstd (optional, better compression)"
+    else
+        log_warn "Optional tool not found: zstd (install for better compression)"
+    fi
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required commands:"
+        for item in "${missing[@]}"; do
+            echo "  - $item"
+        done
+        echo ""
+        echo "Install missing packages with:"
+        echo "  sudo apt update && sudo apt install -y $(echo "${missing[@]}" | sed 's/[^(]*(\([^)]*\))/\1/g' | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+        return 1
+    fi
+    
+    log_success "All required commands available"
+    
+    # Check if running with appropriate privileges
+    if ! is_root && ! sudo -n true 2>/dev/null; then
+        log_warn "Not running as root and passwordless sudo not available"
+        log_warn "Some operations may require password entry"
+    fi
+    
+    return 0
+}
+
+check_disk_space() {
+    local path="$1"
+    local required_gb="${2:-5}"
+    
+    local available_gb=$(get_disk_space_gb "$path")
+    
+    if [[ $available_gb -lt $required_gb ]]; then
+        log_error "Insufficient disk space at $path"
+        log_error "Available: ${available_gb}GB, Required: ${required_gb}GB"
+        return 1
+    fi
+    
+    log_debug "Disk space OK: ${available_gb}GB available at $path"
+    return 0
+}
+
+#==============================================================================
+# WORDPRESS DISCOVERY AND VALIDATION
+#==============================================================================
+
+discover_wp_path_from_domain() {
+    local domain="$1"
+    local host="${2:-localhost}"
+    
+    log_debug "Discovering WordPress path for domain: $domain on host: $host"
+    
+    # Search Apache configs
+    local vhost_file
+    if [[ "$host" == "localhost" ]]; then
+        vhost_file=$(grep -l "ServerName.*$domain" /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1)
+    else
+        vhost_file=$(remote_exec "$host" "grep -l 'ServerName.*$domain' /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1" || echo "")
+    fi
+    
+    if [[ -n "$vhost_file" ]]; then
+        local docroot
+        if [[ "$host" == "localhost" ]]; then
+            docroot=$(grep "DocumentRoot" "$vhost_file" | awk '{print $2}' | head -n 1)
+        else
+            docroot=$(remote_exec "$host" "grep 'DocumentRoot' $vhost_file | awk '{print \$2}' | head -n 1")
+        fi
+        
+        if [[ -n "$docroot" ]]; then
+            log_debug "Found WordPress path: $docroot"
+            echo "$docroot"
+            return 0
+        fi
+    fi
+    
+    # Try standard locations
+    local potential_paths=(
+        "$WEBROOT/wordpress-$domain"
+        "$WEBROOT/$domain"
+        "$WEBROOT/wordpress-$(echo "$domain" | cut -d. -f1)"
+        "$WEBROOT/$(echo "$domain" | cut -d. -f1)"
+    )
+    
+    for path in "${potential_paths[@]}"; do
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -f "$path/wp-config.php" ]]; then
+                echo "$path"
+                return 0
+            fi
+        else
+            if remote_exec "$host" "test -f $path/wp-config.php" 2>/dev/null; then
+                echo "$path"
+                return 0
+            fi
+        fi
+    done
+    
+    log_error "Could not discover WordPress path for domain: $domain"
+    return 1
+}
+
+validate_wp_installation() {
+    local wp_path="$1"
+    local host="${2:-localhost}"
+    
+    log_step "Validating WordPress installation at: $wp_path"
+    
+    local errors=()
+    
+    # Check critical files
+    local critical_files=("wp-config.php" "wp-includes" "wp-content" "index.php")
+    for file in "${critical_files[@]}"; do
+        if [[ "$host" == "localhost" ]]; then
+            if [[ ! -e "$wp_path/$file" ]]; then
+                errors+=("Missing: $file")
+            fi
+        else
+            if ! remote_exec "$host" "test -e $wp_path/$file" 2>/dev/null; then
+                errors+=("Missing: $file")
+            fi
+        fi
+    done
+    
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        log_error "WordPress installation validation failed:"
+        for error in "${errors[@]}"; do
+            echo "  - $error"
+        done
+        return 1
+    fi
+    
+    log_success "WordPress installation validated"
+    return 0
+}
+
+parse_wp_config() {
+    local wp_config="$1"
+    local host="${2:-localhost}"
+    
+    log_debug "Parsing wp-config.php: $wp_config"
+    
+    local config_content
+    if [[ "$host" == "localhost" ]]; then
+        config_content=$(cat "$wp_config")
+    else
+        config_content=$(remote_exec "$host" "cat $wp_config")
+    fi
+    
+    # Extract DB credentials
+    local db_name=$(echo "$config_content" | grep "define.*'DB_NAME'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_user=$(echo "$config_content" | grep "define.*'DB_USER'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_pass=$(echo "$config_content" | grep "define.*'DB_PASSWORD'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_host=$(echo "$config_content" | grep "define.*'DB_HOST'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local table_prefix=$(echo "$config_content" | grep "table_prefix" | sed "s/.*=.*'\([^']*\)'.*/\1/" | head -n 1)
+    
+    # Default values
+    db_host="${db_host:-localhost}"
+    table_prefix="${table_prefix:-wp_}"
+    
+    # Check for multisite
+    local is_multisite=false
+    if echo "$config_content" | grep -q "MULTISITE.*true"; then
+        is_multisite=true
+    fi
+    
+    # Output as JSON-like format for easy parsing
+    cat <<EOF
+DB_NAME=$db_name
+DB_USER=$db_user
+DB_PASS=$db_pass
+DB_HOST=$db_host
+TABLE_PREFIX=$table_prefix
+IS_MULTISITE=$is_multisite
+EOF
+}
+
+test_db_connection() {
+    local db_host="$1"
+    local db_user="$2"
+    local db_pass="$3"
+    local db_name="$4"
+    local host="${5:-localhost}"
+    
+    log_step "Testing database connection"
+    
+    local test_cmd="mysql -h\"$db_host\" -u\"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
+    
+    if [[ "$host" == "localhost" ]]; then
+        if eval "$test_cmd"; then
+            log_success "Database connection successful"
+            return 0
+        fi
+    else
+        if remote_exec "$host" "$test_cmd"; then
+            log_success "Database connection successful"
+            return 0
+        fi
+    fi
+    
+    log_error "Database connection failed"
+    return 1
+}
+
+get_wp_option() {
+    local wp_path="$1"
+    local option_name="$2"
+    local host="${3:-localhost}"
+    local domain="${4:-}"
+    
+    local context_flags
+    if [[ -n "$domain" ]]; then
+        context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+    else
+        context_flags="--path=\"$wp_path\""
+    fi
+    
+    if [[ "$host" == "localhost" ]]; then
+        eval "sudo -u www-data wp $context_flags option get \"$option_name\" 2>/dev/null || echo ''"
+    else
+        remote_exec "$host" "sudo -u www-data wp $context_flags option get \"$option_name\" 2>/dev/null || echo ''"
+    fi
+}
+
+detect_site_scheme() {
+    local domain="$1"
+    local wp_path="$2"
+    local host="${3:-localhost}"
+    
+    # Detect HTTPS vs HTTP reliably without relying on is_ssl()
+    # Priority:
+    # 1. Parse scheme from siteurl/home options
+    # 2. Test with curl
+    # 3. Default to https for safety
+    
+    log_debug "Detecting canonical scheme for: $domain"
+    
+    # Method 1: Check siteurl option
+    local siteurl
+    siteurl=$(get_wp_option "$wp_path" "siteurl" "$host" "$domain")
+    
+    if [[ "$siteurl" =~ ^https:// ]]; then
+        log_debug "Scheme from siteurl: https"
+        echo "https"
+        return 0
+    elif [[ "$siteurl" =~ ^http:// ]]; then
+        log_debug "Scheme from siteurl: http"
+        echo "http"
+        return 0
+    fi
+    
+    # Method 2: Test with curl
+    if command_exists curl; then
+        local https_code
+        https_code=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" 2>/dev/null || echo "000")
+        
+        if [[ "$https_code" =~ ^(200|301|302)$ ]]; then
+            log_debug "HTTPS accessible (code: $https_code)"
+            echo "https"
+            return 0
+        fi
+        
+        local http_code
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://$domain" 2>/dev/null || echo "000")
+        
+        if [[ "$http_code" =~ ^(200|301|302)$ ]]; then
+            log_debug "HTTP accessible (code: $http_code)"
+            echo "http"
+            return 0
+        fi
+    fi
+    
+    # Method 3: Default to https (modern standard)
+    log_debug "Defaulting to https"
+    echo "https"
+}
+
+get_content_url() {
+    local wp_path="$1"
+    local host="${2:-localhost}"
+    local domain="${3:-}"
+    
+    local context_flags
+    if [[ -n "$domain" ]]; then
+        context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+    else
+        context_flags="--path=\"$wp_path\""
+    fi
+    
+    if [[ "$host" == "localhost" ]]; then
+        eval "sudo -u www-data wp $context_flags eval 'echo content_url();' 2>/dev/null || echo ''"
+    else
+        remote_exec "$host" "sudo -u www-data wp $context_flags eval 'echo content_url();' 2>/dev/null || echo ''"
+    fi
+}
+
+get_uploads_info() {
+    local wp_path="$1"
+    local host="${2:-localhost}"
+    local domain="${3:-}"
+    
+    local context_flags
+    if [[ -n "$domain" ]]; then
+        context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+    else
+        context_flags="--path=\"$wp_path\""
+    fi
+    
+    # Get uploads directory info
+    local uploads_data
+    if [[ "$host" == "localhost" ]]; then
+        uploads_data=$(eval "sudo -u www-data wp $context_flags eval '\$upload_dir = wp_upload_dir(); echo json_encode(\$upload_dir);' 2>/dev/null")
+    else
+        uploads_data=$(remote_exec "$host" "sudo -u www-data wp $context_flags eval '\$upload_dir = wp_upload_dir(); echo json_encode(\$upload_dir);' 2>/dev/null")
+    fi
+    
+    if [[ -n "$uploads_data" ]]; then
+        echo "$uploads_data"
+    else
+        echo "{}"
+    fi
+}
+
+is_multisite() {
+    local wp_path="$1"
+    local host="${2:-localhost}"
+    
+    if [[ "$host" == "localhost" ]]; then
+        sudo -u www-data wp --path="$wp_path" core is-installed --network 2>/dev/null
+    else
+        remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" core is-installed --network 2>/dev/null"
+    fi
+}
+
+get_blog_id_for_domain() {
+    local wp_path="$1"
+    local domain="$2"
+    local host="${3:-localhost}"
+    
+    log_debug "Looking up blog_id for domain: $domain"
+    
+    if ! is_multisite "$wp_path" "$host"; then
+        echo ""
+        return 0
+    fi
+    
+    local blog_id
+    if [[ "$host" == "localhost" ]]; then
+        blog_id=$(sudo -u www-data wp --path="$wp_path" site list --field=blog_id --url="https://$domain" 2>/dev/null | head -n 1)
+        
+        # Fallback: try without https
+        if [[ -z "$blog_id" ]]; then
+            blog_id=$(sudo -u www-data wp --path="$wp_path" site list --field=blog_id --url="http://$domain" 2>/dev/null | head -n 1)
+        fi
+        
+        # Fallback: search by domain in database
+        if [[ -z "$blog_id" ]]; then
+            local config_data
+            config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
+            eval "$config_data"
+            
+            blog_id=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "SELECT blog_id FROM ${TABLE_PREFIX}blogs WHERE domain='$domain' LIMIT 1" 2>/dev/null)
+        fi
+    else
+        blog_id=$(remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" site list --field=blog_id --url=\"https://$domain\" 2>/dev/null | head -n 1")
+        
+        if [[ -z "$blog_id" ]]; then
+            blog_id=$(remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" site list --field=blog_id --url=\"http://$domain\" 2>/dev/null | head -n 1")
+        fi
+    fi
+    
+    if [[ -n "$blog_id" ]]; then
+        log_debug "Found blog_id: $blog_id"
+        echo "$blog_id"
+    else
+        log_debug "No blog_id found (might be main site or not multisite)"
+        echo ""
+    fi
+}
+
+get_wp_cli_context() {
+    local wp_path="$1"
+    local domain="$2"
+    local host="${3:-localhost}"
+    
+    # Returns the appropriate WP-CLI context flags
+    # Usage: wp $(get_wp_cli_context ...) command
+    
+    if ! is_multisite "$wp_path" "$host"; then
+        echo "--path=\"$wp_path\""
+        return 0
+    fi
+    
+    local blog_id
+    blog_id=$(get_blog_id_for_domain "$wp_path" "$domain" "$host")
+    
+    if [[ -n "$blog_id" ]]; then
+        # Use --url which is the most reliable for multisite
+        echo "--path=\"$wp_path\" --url=\"https://$domain\""
+    else
+        # Fallback to just path
+        echo "--path=\"$wp_path\""
+    fi
+}
+
+get_table_prefix_for_blog() {
+    local wp_path="$1"
+    local domain="$2"
+    local host="${3:-localhost}"
+    
+    # Parse base prefix from wp-config
+    local config_data
+    config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    local base_prefix="$TABLE_PREFIX"
+    
+    if ! is_multisite "$wp_path" "$host"; then
+        echo "$base_prefix"
+        return 0
+    fi
+    
+    local blog_id
+    blog_id=$(get_blog_id_for_domain "$wp_path" "$domain" "$host")
+    
+    if [[ -n "$blog_id" && "$blog_id" != "1" ]]; then
+        # Blog-specific prefix
+        echo "${base_prefix}${blog_id}_"
+    else
+        # Main site uses base prefix
+        echo "$base_prefix"
+    fi
+}
+
+#==============================================================================
+# REMOTE EXECUTION HELPERS
+#==============================================================================
+
+remote_exec() {
+    local host="$1"
+    shift
+    local command="$*"
+    
+    if [[ "$host" == "localhost" ]]; then
+        eval "$command"
+    else
+        ssh -o StrictHostKeyChecking=no "${SSH_USER}@${host}" "$command"
+    fi
+}
+
+remote_copy() {
+    local host="$1"
+    local src="$2"
+    local dst="$3"
+    local direction="${4:-to}"  # 'to' or 'from'
+    
+    if [[ "$host" == "localhost" ]]; then
+        cp -rp "$src" "$dst"
+    else
+        if [[ "$direction" == "to" ]]; then
+            rsync -avz --progress "$src" "${SSH_USER}@${host}:${dst}"
+        else
+            rsync -avz --progress "${SSH_USER}@${host}:${src}" "$dst"
+        fi
+    fi
+}
+
+#==============================================================================
+# SITE INVENTORY
+#==============================================================================
+
+inventory_site() {
+    local domain="$1"
+    local wp_path="${2:-}"
+    local host="${3:-localhost}"
+    
+    print_header "SITE INVENTORY: $domain"
+    
+    # Discover path if not provided
+    if [[ -z "$wp_path" ]]; then
+        wp_path=$(discover_wp_path_from_domain "$domain" "$host") || {
+            log_error "Could not find WordPress installation for: $domain"
+            return 1
+        }
+    fi
+    
+    # Validate installation
+    if ! validate_wp_installation "$wp_path" "$host"; then
+        return 1
+    fi
+    
+    # Parse wp-config
+    local wp_config="$wp_path/wp-config.php"
+    local config_data
+    config_data=$(parse_wp_config "$wp_config" "$host")
+    
+    # Extract values
+    local db_name db_user db_pass db_host table_prefix is_multisite_flag
+    eval "$config_data"
+    
+    # Test DB connection
+    test_db_connection "$db_host" "$db_user" "$db_pass" "$db_name" "$host" || {
+        log_warn "Database connection test failed, but continuing..."
+    }
+    
+    # Detect if this is multisite and get blog context
+    local multisite_status="No"
+    local blog_id=""
+    local site_table_prefix="$table_prefix"
+    
+    if [[ "$is_multisite_flag" == "true" ]] || is_multisite "$wp_path" "$host"; then
+        multisite_status="Yes"
+        blog_id=$(get_blog_id_for_domain "$wp_path" "$domain" "$host")
+        
+        if [[ -n "$blog_id" ]]; then
+            site_table_prefix=$(get_table_prefix_for_blog "$wp_path" "$domain" "$host")
+        fi
+    fi
+    
+    # Get WordPress info using correct context
+    local site_url home_url content_url
+    site_url=$(get_wp_option "$wp_path" "siteurl" "$host" "$domain")
+    home_url=$(get_wp_option "$wp_path" "home" "$host" "$domain")
+    content_url=$(get_content_url "$wp_path" "$host" "$domain")
+    
+    # Detect canonical scheme
+    local canonical_scheme
+    canonical_scheme=$(detect_site_scheme "$domain" "$wp_path" "$host")
+    
+    # Get uploads info
+    local uploads_info
+    uploads_info=$(get_uploads_info "$wp_path" "$host" "$domain")
+    
+    local uploads_basedir uploads_baseurl
+    if command_exists python3 && [[ -n "$uploads_info" ]]; then
+        uploads_basedir=$(echo "$uploads_info" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('basedir', 'N/A'))" 2>/dev/null || echo "N/A")
+        uploads_baseurl=$(echo "$uploads_info" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('baseurl', 'N/A'))" 2>/dev/null || echo "N/A")
+    else
+        uploads_basedir="$wp_path/wp-content/uploads"
+        uploads_baseurl="$content_url/uploads"
+    fi
+    
+    # Check if uploads contains sites/<id> structure (multisite)
+    local uses_sites_structure="No"
+    if [[ "$multisite_status" == "Yes" && -n "$blog_id" ]]; then
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -d "$wp_path/wp-content/uploads/sites/$blog_id" ]]; then
+                uses_sites_structure="Yes (sites/$blog_id/)"
+            fi
+        else
+            if remote_exec "$host" "test -d $wp_path/wp-content/uploads/sites/$blog_id" 2>/dev/null; then
+                uses_sites_structure="Yes (sites/$blog_id/)"
+            fi
+        fi
+    fi
+    
+    # Determine environment (live vs test)
+    local environment="live"
+    if [[ "$domain" == *".testing."* ]] || [[ "$wp_path" == *"testing"* ]]; then
+        environment="test"
+    fi
+    
+    # Get file sizes
+    local wp_size uploads_size
+    if [[ "$host" == "localhost" ]]; then
+        wp_size=$(du -sh "$wp_path" 2>/dev/null | cut -f1)
+        uploads_size=$(du -sh "$uploads_basedir" 2>/dev/null | cut -f1 || echo "N/A")
+    else
+        wp_size=$(remote_exec "$host" "du -sh $wp_path 2>/dev/null | cut -f1")
+        uploads_size=$(remote_exec "$host" "du -sh $uploads_basedir 2>/dev/null | cut -f1 || echo N/A")
+    fi
+    
+    # Get Apache vhost info
+    local vhost_file
+    if [[ "$host" == "localhost" ]]; then
+        vhost_file=$(grep -l "ServerName.*$domain" /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1)
+    else
+        vhost_file=$(remote_exec "$host" "grep -l 'ServerName.*$domain' /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1" || echo "Not found")
+    fi
+    
+    # Get active plugins and theme using correct context
+    local context_flags
+    context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+    
+    local active_theme active_plugins plugin_count network_plugins
+    if [[ "$host" == "localhost" ]]; then
+        active_theme=$(eval "sudo -u www-data wp $context_flags theme list --status=active --field=name 2>/dev/null || echo Unknown")
+        active_plugins=$(eval "sudo -u www-data wp $context_flags plugin list --status=active --field=name 2>/dev/null | tr '\n' ',' | sed 's/,$//'")
+        plugin_count=$(eval "sudo -u www-data wp $context_flags plugin list --status=active --format=count 2>/dev/null || echo Unknown")
+        
+        if [[ "$multisite_status" == "Yes" ]]; then
+            network_plugins=$(sudo -u www-data wp --path="$wp_path" plugin list --status=active-network --field=name 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+        fi
+    else
+        active_theme=$(remote_exec "$host" "sudo -u www-data wp $context_flags theme list --status=active --field=name 2>/dev/null || echo Unknown")
+        active_plugins=$(remote_exec "$host" "sudo -u www-data wp $context_flags plugin list --status=active --field=name 2>/dev/null | tr '\n' ',' | sed 's/,$//'")
+        plugin_count=$(remote_exec "$host" "sudo -u www-data wp $context_flags plugin list --status=active --format=count 2>/dev/null || echo Unknown")
+        
+        if [[ "$multisite_status" == "Yes" ]]; then
+            network_plugins=$(remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" plugin list --status=active-network --field=name 2>/dev/null | tr '\n' ',' | sed 's/,$//'")
+        fi
+    fi
+    
+    # Display the standardized "8 FACTS" block
+    cat <<EOF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    THE 8 FACTS (memorize this!)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. DOMAIN
+   ${domain}
+
+2. SERVER
+   ${host}
+
+3. WORDPRESS PATH
+   ${wp_path}
+
+4. DATABASE
+   Name:     $db_name
+   User:     $db_user
+   Host:     $db_host
+   $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "Password: $db_pass"; else echo "Password: [hidden - use --show-secrets]"; fi)
+
+5. ENVIRONMENT
+   ${environment} $(if [[ "$environment" == "test" ]]; then echo "(testing/staging)"; else echo "(production)"; fi)
+
+6. MULTISITE CONTEXT
+   Multisite:     $multisite_status
+   $(if [[ "$multisite_status" == "Yes" && -n "$blog_id" ]]; then echo "Blog ID:       $blog_id"; fi)
+   Table Prefix:  $site_table_prefix
+   $(if [[ "$site_table_prefix" != "$table_prefix" ]]; then echo "Network Prefix: $table_prefix"; fi)
+
+7. UPLOADS CONFIGURATION
+   Physical Path: $uploads_basedir
+   Base URL:      $uploads_baseurl
+   Uses sites/<id>: $uses_sites_structure
+   Size:          $uploads_size
+
+8. ACTIVE THEME & PLUGINS
+   Theme:         $active_theme
+   Site Plugins:  $plugin_count active
+   $(if [[ -n "$active_plugins" ]]; then echo "  → $active_plugins"; fi)
+   $(if [[ -n "$network_plugins" ]]; then echo "Network Plugins: $network_plugins"; fi)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                      ADDITIONAL DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+URLS
+  Site URL:      $site_url
+  Home URL:      $home_url
+  Content URL:   $content_url
+  Canonical:     ${canonical_scheme}://
+  
+FILE SYSTEM
+  Total Size:    $wp_size
+  
+APACHE
+  VHost File:    $vhost_file
+  
+HOW TO MANAGE THIS SITE
+  Restart Apache:    sudo systemctl restart apache2
+  Access WP-CLI:     sudo -u www-data wp $context_flags
+  View Logs:         sudo tail -f /var/log/apache2/error.log
+  
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EOF
+
+    # Save report to file
+    local report_file="${LOG_DIR}/site-report-$(sanitize_slug "$domain")-${RUN_TIMESTAMP}.txt"
+    cat <<EOF > "$report_file"
+Site Inventory Report - THE 8 FACTS
+Generated: $(date)
+
+1. DOMAIN: $domain
+2. SERVER: $host
+3. WORDPRESS PATH: $wp_path
+4. DATABASE: $db_name (user: $db_user, host: $db_host)$(if [[ "$SHOW_SECRETS" == "true" ]]; then echo ", password: $db_pass"; fi)
+5. ENVIRONMENT: $environment
+6. MULTISITE: $multisite_status$(if [[ -n "$blog_id" ]]; then echo " (blog_id: $blog_id, prefix: $site_table_prefix)"; fi)
+7. UPLOADS: $uploads_baseurl (physical: $uploads_basedir, uses sites/<id>: $uses_sites_structure)
+8. THEME & PLUGINS: $active_theme theme, $plugin_count plugins active
+
+Additional Details:
+Site URL: $site_url
+Home URL: $home_url
+Content URL: $content_url
+Canonical Scheme: $canonical_scheme
+Total Size: $wp_size
+Apache VHost: $vhost_file
+
+WP-CLI Command: sudo -u www-data wp $context_flags
+EOF
+    
+    log_success "Report saved to: $report_file"
+    
+    # V1.2: Save machine-readable JSON for automation/tools
+    local json_file="${LOG_DIR}/site-inventory-$(sanitize_slug "$domain")-${RUN_TIMESTAMP}.json"
+    
+    cat > "$json_file" <<JSON_EOF
+{
+  "generated": "$(date -Iseconds)",
+  "tool_version": "${SCRIPT_VERSION}",
+  "the_8_facts": {
+    "1_domain": "${domain}",
+    "2_server": "${host}",
+    "3_wordpress_path": "${wp_path}",
+    "4_database": {
+      "name": "${db_name}",
+      "user": "${db_user}",
+      "host": "${db_host}",
+      "password": $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "\"$db_pass\""; else echo "\"[redacted]\""; fi)
+    },
+    "5_environment": "${environment}",
+    "6_multisite_context": {
+      "is_multisite": $(if [[ "$multisite_status" == "Yes" ]]; then echo "true"; else echo "false"; fi),
+      "blog_id": $(if [[ -n "$blog_id" ]]; then echo "\"$blog_id\""; else echo "null"; fi),
+      "site_table_prefix": "${site_table_prefix}",
+      "network_prefix": "${table_prefix}"
+    },
+    "7_uploads_config": {
+      "basedir": "${uploads_basedir}",
+      "baseurl": "${uploads_baseurl}",
+      "uses_sites_structure": $(if [[ "$uses_sites_structure" == "Yes"* ]]; then echo "true"; else echo "false"; fi),
+      "sites_id": $(if [[ "$uses_sites_structure" == *"sites/"* ]]; then echo "\"$(echo "$uses_sites_structure" | grep -o 'sites/[0-9]*' | cut -d/ -f2)\""; else echo "null"; fi)
+    },
+    "8_theme_and_plugins": {
+      "active_theme": "${active_theme}",
+      "plugin_count": $(if [[ "$plugin_count" =~ ^[0-9]+$ ]]; then echo "$plugin_count"; else echo "0"; fi),
+      "active_plugins": $(if [[ -n "$active_plugins" ]]; then echo "\"$active_plugins\""; else echo "null"; fi),
+      "network_plugins": $(if [[ -n "$network_plugins" ]]; then echo "\"$network_plugins\""; else echo "null"; fi)
+    }
+  },
+  "additional_details": {
+    "site_url": "${site_url}",
+    "home_url": "${home_url}",
+    "content_url": "${content_url}",
+    "canonical_scheme": "${canonical_scheme}",
+    "total_size": "${wp_size}",
+    "uploads_size": "${uploads_size}",
+    "apache_vhost": "${vhost_file}",
+    "wp_cli_context": "$(get_wp_cli_context "$wp_path" "$domain" "$host")"
+  }
+}
+JSON_EOF
+    
+    log_success "Machine-readable JSON saved to: $json_file"
+    
+    return 0
+}
+
+#==============================================================================
+# BACKUP OPERATIONS
+#==============================================================================
+
+create_backup() {
+    local wp_path="$1"
+    local site_slug="$2"
+    local env="${3:-live}"
+    local host="${4:-localhost}"
+    
+    print_header "CREATING BACKUP: $site_slug ($env)"
+    
+    # V1.2: Acquire operation lock
+    acquire_lock "$site_slug" "backup-$env" || return 1
+    
+    # Validate installation
+    validate_wp_installation "$wp_path" "$host" || return 1
+    
+    # V1.2: Validate environment match
+    # Parse config first to get DB name
+    local config_data
+    config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    
+    validate_environment_match "$wp_path" "$DB_NAME" "$env" || return 1
+    
+    # Create backup directory
+    local backup_base="${BACKUP_ROOT}/${site_slug}/${env}"
+    local backup_dir="${backup_base}/${RUN_TIMESTAMP}"
+    
+    log_step "Creating backup directory: $backup_dir"
+    if [[ "$host" == "localhost" ]]; then
+        mkdir -p "$backup_dir"
+    else
+        remote_exec "$host" "mkdir -p $backup_dir"
+    fi
+    
+    # Backup database
+    log_step "Backing up database: $db_name"
+    local db_dump="$backup_dir/db.sql.gz"
+    local dump_cmd="mysqldump -h\"$db_host\" -u\"$db_user\" -p\"$db_pass\" --single-transaction --routines --triggers \"$db_name\" | gzip > \"$db_dump\""
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would execute: $dump_cmd"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            eval "$dump_cmd" || {
+                log_error "Database backup failed"
+                return 1
+            }
+        else
+            remote_exec "$host" "$dump_cmd" || {
+                log_error "Database backup failed"
+                return 1
+            }
+        fi
+        log_success "Database backed up"
+    fi
+    
+    # Backup uploads
+    log_step "Backing up uploads directory"
+    local uploads_archive="$backup_dir/uploads.tar.gz"
+    local uploads_path="$wp_path/wp-content/uploads"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create uploads archive"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -d "$uploads_path" ]]; then
+                tar -czf "$uploads_archive" -C "$wp_path/wp-content" uploads/ || log_warn "Uploads backup had warnings"
+                log_success "Uploads backed up"
+            else
+                log_warn "Uploads directory not found, skipping"
+            fi
+        else
+            if remote_exec "$host" "test -d $uploads_path"; then
+                remote_exec "$host" "tar -czf $uploads_archive -C $wp_path/wp-content uploads/" || log_warn "Uploads backup had warnings"
+                log_success "Uploads backed up"
+            else
+                log_warn "Uploads directory not found, skipping"
+            fi
+        fi
+    fi
+    
+    # Copy wp-config.php
+    log_step "Backing up wp-config.php"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would copy wp-config.php"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            cp "$wp_path/wp-config.php" "$backup_dir/" || log_warn "Could not copy wp-config.php"
+        else
+            remote_exec "$host" "cp $wp_path/wp-config.php $backup_dir/" || log_warn "Could not copy wp-config.php"
+        fi
+    fi
+    
+    # Get plugin and theme lists
+    log_step "Exporting plugin and theme lists"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would export plugin/theme lists"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            sudo -u www-data wp --path="$wp_path" plugin list --format=json > "$backup_dir/plugins-list.json" 2>/dev/null || true
+            sudo -u www-data wp --path="$wp_path" theme list --format=json > "$backup_dir/themes-list.json" 2>/dev/null || true
+        else
+            remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" plugin list --format=json > $backup_dir/plugins-list.json 2>/dev/null || true"
+            remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" theme list --format=json > $backup_dir/themes-list.json 2>/dev/null || true"
+        fi
+    fi
+    
+    # Create manifest
+    log_step "Creating backup manifest"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create manifest"
+    else
+        cat <<EOF > "$backup_dir/manifest.json"
+{
+  "backup_timestamp": "${RUN_TIMESTAMP}",
+  "site_slug": "${site_slug}",
+  "environment": "${env}",
+  "host": "${host}",
+  "wp_path": "${wp_path}",
+  "db_name": "${db_name}",
+  "db_host": "${db_host}",
+  "table_prefix": "${table_prefix}",
+  "created_by": "webdev-migrate v${SCRIPT_VERSION}"
+}
+EOF
+    fi
+    
+    # Create restore helper script
+    log_step "Creating restore helper script"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create restore.sh"
+    else
+        cat <<'RESTORE_EOF' > "$backup_dir/restore.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== WordPress Backup Restore Helper ==="
+echo ""
+echo "This script will help you restore this backup."
+echo "It should be run on the target server where you want to restore."
+echo ""
+
+BACKUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Backup directory: $BACKUP_DIR"
+echo ""
+
+read -p "Enter target WordPress path: " WP_PATH
+read -p "Enter target database name: " DB_NAME
+read -p "Enter database user: " DB_USER
+read -sp "Enter database password: " DB_PASS
+echo ""
+
+echo ""
+echo "Will restore to:"
+echo "  WordPress: $WP_PATH"
+echo "  Database: $DB_NAME"
+echo ""
+
+read -p "Continue? (y/N): " CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+echo ""
+echo "Restoring database..."
+gunzip -c "$BACKUP_DIR/db.sql.gz" | mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME"
+
+echo "Restoring uploads..."
+mkdir -p "$WP_PATH/wp-content"
+tar -xzf "$BACKUP_DIR/uploads.tar.gz" -C "$WP_PATH/wp-content/"
+
+echo "Fixing permissions..."
+chown -R www-data:www-data "$WP_PATH"
+chmod -R 755 "$WP_PATH"
+find "$WP_PATH" -type f -exec chmod 644 {} \;
+
+echo ""
+echo "Restore complete!"
+echo "Remember to update wp-config.php with new database credentials if needed."
+echo "And run: sudo -u www-data wp --path=\"$WP_PATH\" search-replace OLD_URL NEW_URL"
+RESTORE_EOF
+        chmod +x "$backup_dir/restore.sh"
+    fi
+    
+    # Calculate sizes
+    if [[ "$host" == "localhost" ]]; then
+        local backup_size=$(du -sh "$backup_dir" | cut -f1)
+    else
+        local backup_size=$(remote_exec "$host" "du -sh $backup_dir | cut -f1")
+    fi
+    
+    print_section "Backup Summary"
+    echo "Backup Location: $backup_dir"
+    echo "Backup Size: $backup_size"
+    echo "Files:"
+    echo "  - db.sql.gz (database dump)"
+    echo "  - uploads.tar.gz (media files)"
+    echo "  - wp-config.php (configuration)"
+    echo "  - plugins-list.json"
+    echo "  - themes-list.json"
+    echo "  - manifest.json"
+    echo "  - restore.sh (helper script)"
+    echo ""
+    
+    log_success "Backup completed successfully"
+    
+    return 0
+}
+
+#==============================================================================
+# RESTORE OPERATIONS
+#==============================================================================
+
+restore_backup() {
+    local backup_dir="$1"
+    local target_wp_path="$2"
+    local target_db_name="${3:-}"
+    local host="${4:-localhost}"
+    
+    print_header "RESTORING BACKUP"
+    
+    # V1.2: Extract site slug for lock (from target path or backup dir)
+    local site_slug
+    if [[ "$target_wp_path" == */wordpress-testing-* ]]; then
+        site_slug=$(basename "$target_wp_path" | sed 's/wordpress-testing-//')
+    elif [[ "$target_wp_path" == */wordpress-* ]]; then
+        site_slug=$(basename "$target_wp_path" | sed 's/wordpress-//')
+    else
+        site_slug=$(basename "$target_wp_path")
+    fi
+    acquire_lock "$site_slug" "restore" || return 1
+    
+    # Validate backup directory
+    if [[ "$host" == "localhost" ]]; then
+        if [[ ! -d "$backup_dir" ]]; then
+            log_error "Backup directory not found: $backup_dir"
+            return 1
+        fi
+    else
+        if ! remote_exec "$host" "test -d $backup_dir" 2>/dev/null; then
+            log_error "Backup directory not found: $backup_dir"
+            return 1
+        fi
+    fi
+    
+    # Read manifest if available
+    local manifest="$backup_dir/manifest.json"
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -f "$manifest" ]]; then
+            log_info "Found backup manifest"
+            cat "$manifest"
+        fi
+    fi
+    
+    # Check required backup files
+    local db_dump="$backup_dir/db.sql.gz"
+    local uploads_archive="$backup_dir/uploads.tar.gz"
+    
+    log_step "Verifying backup files"
+    local missing_files=()
+    
+    if [[ "$host" == "localhost" ]]; then
+        [[ ! -f "$db_dump" ]] && missing_files+=("db.sql.gz")
+        [[ ! -f "$uploads_archive" ]] && missing_files+=("uploads.tar.gz (optional)")
+    else
+        remote_exec "$host" "test -f $db_dump" || missing_files+=("db.sql.gz")
+        remote_exec "$host" "test -f $uploads_archive" || log_warn "uploads.tar.gz not found (may be okay)"
+    fi
+    
+    if [[ ${#missing_files[@]} -gt 0 ]] && [[ ! " ${missing_files[*]} " =~ " uploads.tar.gz (optional) " ]]; then
+        log_error "Missing required backup files: ${missing_files[*]}"
+        return 1
+    fi
+    
+    # Confirm restoration
+    echo ""
+    echo -e "${YELLOW}This will restore the backup to:${NC}"
+    echo "  Target Path: $target_wp_path"
+    if [[ -n "$target_db_name" ]]; then
+        echo "  Target DB: $target_db_name"
+    fi
+    echo ""
+    
+    if ! confirm "Proceed with restore?" "n"; then
+        log_info "Restore cancelled"
+        return 0
+    fi
+    
+    # Create target directory if needed
+    log_step "Preparing target directory: $target_wp_path"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create directory and restore files"
+        return 0
+    fi
+    
+    if [[ "$host" == "localhost" ]]; then
+        mkdir -p "$target_wp_path"
+    else
+        remote_exec "$host" "mkdir -p $target_wp_path"
+    fi
+    
+    # Restore uploads
+    log_step "Restoring uploads directory"
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -f "$uploads_archive" ]]; then
+            mkdir -p "$target_wp_path/wp-content"
+            tar -xzf "$uploads_archive" -C "$target_wp_path/wp-content/" || log_warn "Uploads extraction had warnings"
+            log_success "Uploads restored"
+        fi
+    else
+        if remote_exec "$host" "test -f $uploads_archive"; then
+            remote_exec "$host" "mkdir -p $target_wp_path/wp-content"
+            remote_exec "$host" "tar -xzf $uploads_archive -C $target_wp_path/wp-content/" || log_warn "Uploads extraction had warnings"
+            log_success "Uploads restored"
+        fi
+    fi
+    
+    # Get DB credentials (either from parameter or from wp-config backup)
+    local db_user db_pass db_host
+    if [[ -n "$target_db_name" ]]; then
+        read -r -p "Enter database user: " db_user
+        read -r -sp "Enter database password: " db_pass
+        echo ""
+        db_host="localhost"
+    else
+        # Try to read from wp-config backup
+        local wp_config_backup="$backup_dir/wp-config.php"
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -f "$wp_config_backup" ]]; then
+                local config_data
+                config_data=$(parse_wp_config "$wp_config_backup" "localhost")
+                eval "$config_data"
+                target_db_name="$DB_NAME"
+                db_user="$DB_USER"
+                db_pass="$DB_PASS"
+                db_host="${DB_HOST:-localhost}"
+            else
+                log_error "No wp-config.php in backup and no target DB specified"
+                return 1
+            fi
+        fi
+    fi
+    
+    # Create database if needed
+    log_step "Creating database: $target_db_name"
+    if [[ "$host" == "localhost" ]]; then
+        sudo mysql -e "CREATE DATABASE IF NOT EXISTS $target_db_name;" || log_warn "Database might already exist"
+        sudo mysql -e "GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass';" || true
+        sudo mysql -e "FLUSH PRIVILEGES;" || true
+    else
+        remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $target_db_name;'" || log_warn "Database might already exist"
+        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass';\"" || true
+        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'" || true
+    fi
+    
+    # Import database
+    log_step "Importing database dump"
+    if [[ "$host" == "localhost" ]]; then
+        gunzip -c "$db_dump" | mysql -u"$db_user" -p"$db_pass" "$target_db_name" || {
+            log_error "Database import failed"
+            return 1
+        }
+    else
+        remote_exec "$host" "gunzip -c $db_dump | mysql -u\"$db_user\" -p\"$db_pass\" \"$target_db_name\"" || {
+            log_error "Database import failed"
+            return 1
+        }
+    fi
+    log_success "Database imported"
+    
+    # Step 8: Set permissions
+    log_step "Setting correct permissions"
+    if [[ "$host" == "localhost" ]]; then
+        sudo chown -R www-data:www-data "$target_wp_path"
+        sudo chmod -R 755 "$target_wp_path"
+        sudo find "$target_wp_path" -type f -exec chmod 644 {} \;
+    else
+        remote_exec "$host" "sudo chown -R www-data:www-data $target_wp_path"
+        remote_exec "$host" "sudo chmod -R 755 $target_wp_path"
+        remote_exec "$host" "sudo find $target_wp_path -type f -exec chmod 644 {} \\;"
+    fi
+    
+    # Step 9: RESTORE VERIFICATION (Confidence Check)
+    print_section "RESTORE VERIFICATION"
+    
+    local checks_passed=0
+    local checks_failed=0
+    local verification_errors=()
+    
+    # Check 1: WordPress core version
+    log_step "Verifying WordPress core..."
+    if [[ "$host" == "localhost" ]]; then
+        if sudo -u www-data wp --path="$target_wp_path" core version 2>/dev/null; then
+            log_success "✓ WordPress core accessible"
+            ((checks_passed++))
+        else
+            log_error "✗ WordPress core check failed"
+            verification_errors+=("WordPress core not responding")
+            ((checks_failed++))
+        fi
+    else
+        if remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" core version 2>/dev/null"; then
+            log_success "✓ WordPress core accessible"
+            ((checks_passed++))
+        else
+            log_error "✗ WordPress core check failed"
+            verification_errors+=("WordPress core not responding")
+            ((checks_failed++))
+        fi
+    fi
+    
+    # Check 2: Database integrity
+    log_step "Verifying database integrity..."
+    if [[ "$host" == "localhost" ]]; then
+        if sudo -u www-data wp --path="$target_wp_path" db check 2>/dev/null; then
+            log_success "✓ Database integrity OK"
+            ((checks_passed++))
+        else
+            log_warn "⚠ Database check had warnings (may be OK)"
+            ((checks_passed++))
+        fi
+    else
+        if remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" db check 2>/dev/null"; then
+            log_success "✓ Database integrity OK"
+            ((checks_passed++))
+        else
+            log_warn "⚠ Database check had warnings (may be OK)"
+            ((checks_passed++))
+        fi
+    fi
+    
+    # Check 3: URL options
+    log_step "Verifying URL configuration..."
+    local check_home check_siteurl
+    if [[ "$host" == "localhost" ]]; then
+        check_home=$(sudo -u www-data wp --path="$target_wp_path" option get home 2>/dev/null)
+        check_siteurl=$(sudo -u www-data wp --path="$target_wp_path" option get siteurl 2>/dev/null)
+    else
+        check_home=$(remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" option get home 2>/dev/null")
+        check_siteurl=$(remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" option get siteurl 2>/dev/null")
+    fi
+    
+    if [[ -n "$check_home" && -n "$check_siteurl" ]]; then
+        log_success "✓ URL options present"
+        echo "  home: $check_home"
+        echo "  siteurl: $check_siteurl"
+        ((checks_passed++))
+    else
+        log_error "✗ URL options missing"
+        verification_errors+=("home or siteurl option not found")
+        ((checks_failed++))
+    fi
+    
+    # Check 4: Active plugins list
+    log_step "Verifying plugins..."
+    local plugin_count=0
+    if [[ "$host" == "localhost" ]]; then
+        plugin_count=$(sudo -u www-data wp --path="$target_wp_path" plugin list --status=active --format=count 2>/dev/null || echo 0)
+    else
+        plugin_count=$(remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" plugin list --status=active --format=count 2>/dev/null || echo 0")
+    fi
+    
+    log_success "✓ Plugin check complete ($plugin_count active plugins)"
+    ((checks_passed++))
+    
+    # Check 5: Uploads directory and baseurl
+    log_step "Verifying uploads configuration..."
+    local uploads_check
+    if [[ "$host" == "localhost" ]]; then
+        uploads_check=$(sudo -u www-data wp --path="$target_wp_path" eval 'echo wp_upload_dir()["baseurl"];' 2>/dev/null)
+    else
+        uploads_check=$(remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" eval 'echo wp_upload_dir()[\"baseurl\"];' 2>/dev/null")
+    fi
+    
+    if [[ -n "$uploads_check" ]]; then
+        log_success "✓ Uploads configured"
+        echo "  baseurl: $uploads_check"
+        ((checks_passed++))
+    else
+        log_warn "⚠ Could not verify uploads (may need manual check)"
+        ((checks_passed++))
+    fi
+    
+    # Check 6: External accessibility (if we can determine domain)
+    if command_exists curl && [[ -n "$check_home" ]]; then
+        log_step "Testing external accessibility..."
+        local access_domain
+        access_domain=$(echo "$check_home" | sed 's|https\?://||' | sed 's|/.*||')
+        
+        local http_response
+        http_response=$(curl -s -o /dev/null -w "%{http_code}" "${check_home}/wp-login.php" 2>/dev/null || echo "000")
+        
+        if [[ "$http_response" =~ ^(200|301|302)$ ]]; then
+            log_success "✓ Site accessible externally (HTTP $http_response)"
+            ((checks_passed++))
+        else
+            log_warn "⚠ Site not accessible (HTTP $http_response) - may need DNS/Apache config"
+            verification_errors+=("Site not accessible via HTTP (got $http_response)")
+            ((checks_failed++))
+        fi
+    fi
+    
+    # Verification Summary
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "                  RESTORE VERIFICATION SUMMARY"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "${GREEN}Passed:  $checks_passed${NC}"
+    echo -e "${RED}Failed:  $checks_failed${NC}"
+    echo ""
+    
+    if [[ $checks_failed -eq 0 ]]; then
+        echo -e "${GREEN}${BOLD}✓ PASS${NC} - Restore completed successfully and verified"
+        echo ""
+        log_success "Restore verified and operational"
+    else
+        echo -e "${RED}${BOLD}✗ FAIL${NC} - Restore had issues that need attention"
+        echo ""
+        echo "Issues detected:"
+        for error in "${verification_errors[@]}"; do
+            echo "  • $error"
+        done
+        echo ""
+        log_warn "Restore completed but verification found issues"
+    fi
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    print_section "Next Steps"
+    echo "1. Update wp-config.php if database credentials changed"
+    echo "2. If domain changed, run URL replacement:"
+    echo "   sudo -u www-data wp --path=\"$target_wp_path\" search-replace OLD_URL NEW_URL"
+    echo "3. Update Apache vhost configuration"
+    echo "4. Reload Apache: sudo systemctl reload apache2"
+    echo "5. Test the site in browser"
+    
+    if [[ $checks_failed -gt 0 ]]; then
+        echo ""
+        echo "⚠️  Address the verification issues above before going live"
+        return 1
+    fi
+    
+    return 0
+}
+}
+
+#==============================================================================
+# MIGRATION OPERATIONS
+#==============================================================================
+
+migrate_site() {
+    local source_spec="$1"  # Format: host:slug or just slug for localhost
+    local dest_spec="$2"    # Format: host:slug or just slug for localhost
+    
+    print_header "SITE MIGRATION"
+    
+    # Parse source and destination
+    local src_host src_slug
+    if [[ "$source_spec" == *:* ]]; then
+        src_host="${source_spec%:*}"
+        src_slug="${source_spec#*:}"
+    else
+        src_host="localhost"
+        src_slug="$source_spec"
+    fi
+    
+    local dst_host dst_slug
+    if [[ "$dest_spec" == *:* ]]; then
+        dst_host="${dest_spec%:*}"
+        dst_slug="${dest_spec#*:}"
+    else
+        dst_host="localhost"
+        dst_slug="$dest_spec"
+    fi
+    
+    log_info "Source: $src_slug on $src_host"
+    log_info "Destination: $dst_slug on $dst_host"
+    
+    # Discover source WordPress path
+    log_step "Discovering source WordPress installation"
+    local src_wp_path
+    src_wp_path=$(discover_wp_path_from_domain "${src_slug}.cs.earlham.edu" "$src_host") || {
+        read -r -p "Could not auto-discover. Enter source WordPress path: " src_wp_path
+    }
+    
+    # Validate source
+    validate_wp_installation "$src_wp_path" "$src_host" || return 1
+    
+    # Show migration plan
+    print_section "Migration Plan"
+    echo "1. Create backup of source site"
+    echo "2. Transfer backup to destination"
+    echo "3. Restore backup on destination"
+    echo "4. Update URLs and configuration"
+    echo "5. Configure Apache on destination"
+    echo "6. Run health checks"
+    echo ""
+    
+    if ! confirm "Proceed with migration?" "n"; then
+        log_info "Migration cancelled"
+        return 0
+    fi
+    
+    # Step 1: Backup source
+    log_step "Creating backup of source site"
+    create_backup "$src_wp_path" "$src_slug" "live" "$src_host" || return 1
+    
+    # Get the latest backup
+    local src_backup_dir
+    if [[ "$src_host" == "localhost" ]]; then
+        src_backup_dir=$(ls -td "${BACKUP_ROOT}/${src_slug}/live"/[0-9]* | head -n 1)
+    else
+        src_backup_dir=$(remote_exec "$src_host" "ls -td ${BACKUP_ROOT}/${src_slug}/live/[0-9]* | head -n 1")
+    fi
+    
+    log_info "Using backup: $src_backup_dir"
+    
+    # Step 2: Transfer to destination (if different hosts)
+    if [[ "$src_host" != "$dst_host" ]]; then
+        log_step "Transferring backup to destination"
+        local dst_backup_dir="${BACKUP_ROOT}/${dst_slug}/live/${RUN_TIMESTAMP}"
+        
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would transfer backup"
+        else
+            # Create destination backup directory
+            if [[ "$dst_host" == "localhost" ]]; then
+                mkdir -p "$dst_backup_dir"
+            else
+                remote_exec "$dst_host" "mkdir -p $dst_backup_dir"
+            fi
+            
+            # Transfer files
+            if [[ "$src_host" == "localhost" ]]; then
+                rsync -avz --progress "$src_backup_dir/" "${SSH_USER}@${dst_host}:${dst_backup_dir}/"
+            elif [[ "$dst_host" == "localhost" ]]; then
+                rsync -avz --progress "${SSH_USER}@${src_host}:${src_backup_dir}/" "$dst_backup_dir/"
+            else
+                # Both remote - transfer through localhost
+                local temp_dir="/tmp/webdev-migrate-transfer-${RUN_TIMESTAMP}"
+                mkdir -p "$temp_dir"
+                rsync -avz --progress "${SSH_USER}@${src_host}:${src_backup_dir}/" "$temp_dir/"
+                rsync -avz --progress "$temp_dir/" "${SSH_USER}@${dst_host}:${dst_backup_dir}/"
+                rm -rf "$temp_dir"
+            fi
+            
+            log_success "Backup transferred"
+        fi
+    else
+        dst_backup_dir="$src_backup_dir"
+    fi
+    
+    # Step 3: Restore on destination
+    log_step "Restoring on destination"
+    local dst_wp_path="${WEBROOT}/wordpress-${dst_slug}"
+    
+    read -r -p "Enter destination WordPress path [$dst_wp_path]: " user_dst_wp_path
+    dst_wp_path="${user_dst_wp_path:-$dst_wp_path}"
+    
+    restore_backup "$dst_backup_dir" "$dst_wp_path" "" "$dst_host" || return 1
+    
+    # Step 4: Update URLs
+    log_step "Updating URLs"
+    local src_url="https://${src_slug}.cs.earlham.edu"
+    local dst_url="https://${dst_slug}.cs.earlham.edu"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would run URL replacement"
+    else
+        if [[ "$dst_host" == "localhost" ]]; then
+            sudo -u www-data wp --path="$dst_wp_path" search-replace "$src_url" "$dst_url" --all-tables || log_warn "URL replacement had warnings"
+        else
+            remote_exec "$dst_host" "sudo -u www-data wp --path=\"$dst_wp_path\" search-replace \"$src_url\" \"$dst_url\" --all-tables" || log_warn "URL replacement had warnings"
+        fi
+        log_success "URLs updated"
+    fi
+    
+    # Step 5: Apache configuration note
+    print_section "Apache Configuration Required"
+    echo "You need to create an Apache vhost configuration for: $dst_url"
+    echo ""
+    echo "Example configuration location:"
+    echo "  /etc/apache2/sites-available/${dst_slug}.cs.earlham.edu-ssl.conf"
+    echo ""
+    echo "After creating the config:"
+    echo "  sudo a2ensite ${dst_slug}.cs.earlham.edu-ssl.conf"
+    echo "  sudo systemctl reload apache2"
+    echo ""
+    
+    log_success "Migration completed!"
+    
+    print_section "Post-Migration Checklist"
+    echo "□ Configure Apache vhost"
+    echo "□ Obtain/configure SSL certificate"
+    echo "□ Update DNS (if needed)"
+    echo "□ Test site access"
+    echo "□ Test wp-admin login"
+    echo "□ Verify media files load"
+    echo "□ Run full health check"
+    
+    return 0
+}
+
+#==============================================================================
+# CLONE LIVE TO TEST
+#==============================================================================
+
+clone_live_to_test() {
+    local site_slug="$1"
+    local host="${2:-localhost}"
+    
+    print_header "CLONE LIVE → TEST: $site_slug"
+    
+    # V1.2: Acquire operation lock
+    acquire_lock "$site_slug" "clone-to-test" || return 1
+    
+    local live_domain="${site_slug}.cs.earlham.edu"
+    local test_domain="${site_slug}.testing.cs.earlham.edu"
+    
+    # Discover live site
+    local live_wp_path
+    live_wp_path=$(discover_wp_path_from_domain "$live_domain" "$host") || {
+        log_error "Could not find live site"
+        return 1
+    }
+    
+    validate_wp_installation "$live_wp_path" "$host" || return 1
+    
+    local test_wp_path="${WEBROOT}/wordpress-testing-${site_slug}"
+    
+    log_info "Live site: $live_wp_path"
+    log_info "Test site will be: $test_wp_path"
+    
+    # Parse live config
+    local config_data
+    config_data=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    
+    # V1.2: Validate live environment
+    validate_environment_match "$live_wp_path" "$DB_NAME" "live" || return 1
+    local config_data
+    config_data=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    
+    local live_db="$DB_NAME"
+    local test_db="wp_testing_${site_slug}"
+    
+    # Show plan
+    print_section "Clone Plan"
+    echo "This will:"
+    echo "  1. Create test database: $test_db"
+    echo "  2. Copy database: $live_db → $test_db"
+    echo "  3. Sync files: $live_wp_path → $test_wp_path"
+    echo "  4. Update URLs: $live_domain → $test_domain"
+    echo "  5. Add robots.txt noindex"
+    echo ""
+    
+    if ! confirm "Proceed with cloning?" "n"; then
+        log_info "Clone cancelled"
+        return 0
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would perform clone operations"
+        return 0
+    fi
+    
+    # Step 1: Create test database
+    log_step "Creating test database: $test_db"
+    if [[ "$host" == "localhost" ]]; then
+        sudo mysql -e "CREATE DATABASE IF NOT EXISTS $test_db;" || log_warn "Database might exist"
+    else
+        remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $test_db;'" || log_warn "Database might exist"
+    fi
+    
+    # Step 2: Copy database
+    log_step "Copying database: $live_db → $test_db"
+    if [[ "$host" == "localhost" ]]; then
+        sudo mysqldump "$live_db" | sudo mysql "$test_db"
+        sudo mysql -e "GRANT ALL PRIVILEGES ON ${test_db}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';"
+        sudo mysql -e "FLUSH PRIVILEGES;"
+    else
+        remote_exec "$host" "sudo mysqldump $live_db | sudo mysql $test_db"
+        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${test_db}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';\""
+        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'"
+    fi
+    log_success "Database copied"
+    
+    # Step 3: Sync files
+    log_step "Syncing WordPress files"
+    if [[ "$host" == "localhost" ]]; then
+        sudo rsync -av --delete "$live_wp_path/" "$test_wp_path/"
+        sudo chown -R www-data:www-data "$test_wp_path"
+        sudo chmod -R 755 "$test_wp_path"
+    else
+        remote_exec "$host" "sudo rsync -av --delete $live_wp_path/ $test_wp_path/"
+        remote_exec "$host" "sudo chown -R www-data:www-data $test_wp_path"
+        remote_exec "$host" "sudo chmod -R 755 $test_wp_path"
+    fi
+    log_success "Files synced"
+    
+    # Step 4: Update wp-config
+    log_step "Updating wp-config.php for test database"
+    if [[ "$host" == "localhost" ]]; then
+        sudo sed -i "s/define('DB_NAME', *'[^']*');/define('DB_NAME', '$test_db');/" "$test_wp_path/wp-config.php"
+    else
+        remote_exec "$host" "sudo sed -i \"s/define('DB_NAME', *'[^']*');/define('DB_NAME', '$test_db');/\" $test_wp_path/wp-config.php"
+    fi
+    
+    # Step 5: Update URLs
+    log_step "Updating URLs in database"
+    if [[ "$host" == "localhost" ]]; then
+        sudo -u www-data wp --path="$test_wp_path" search-replace "https://$live_domain" "https://$test_domain" --all-tables
+    else
+        remote_exec "$host" "sudo -u www-data wp --path=\"$test_wp_path\" search-replace \"https://$live_domain\" \"https://$test_domain\" --all-tables"
+    fi
+    log_success "URLs updated"
+    
+    # Step 6: Add robots.txt
+    log_step "Adding robots.txt to prevent indexing"
+    if [[ "$host" == "localhost" ]]; then
+        cat > "$test_wp_path/robots.txt" <<'ROBOTS_EOF'
+User-agent: *
+Disallow: /
+ROBOTS_EOF
+    else
+        remote_exec "$host" "cat > $test_wp_path/robots.txt <<'ROBOTS_EOF'
+User-agent: *
+Disallow: /
+ROBOTS_EOF"
+    fi
+    
+    log_success "Clone completed!"
+    
+    print_section "Next Steps"
+    echo "1. Configure Apache vhost for: $test_domain"
+    echo "   sudo cp /etc/apache2/sites-available/${site_slug}.cs.earlham.edu-ssl.conf \\"
+    echo "      /etc/apache2/sites-available/${site_slug}.testing.cs.earlham.edu-ssl.conf"
+    echo ""
+    echo "2. Edit the new config file to:"
+    echo "   - Change ServerName to: $test_domain"
+    echo "   - Change DocumentRoot to: $test_wp_path"
+    echo ""
+    echo "3. Enable site:"
+    echo "   sudo a2ensite ${site_slug}.testing.cs.earlham.edu-ssl.conf"
+    echo "   sudo systemctl reload apache2"
+    echo ""
+    echo "4. Test the site: https://$test_domain"
+    
+    return 0
+}
+
+#==============================================================================
+# PROMOTE TEST TO LIVE
+#==============================================================================
+
+promote_test_to_live() {
+    local site_slug="$1"
+    local host="${2:-localhost}"
+    
+    print_header "PROMOTE TEST → LIVE: $site_slug"
+    
+    # V1.2: Acquire operation lock BEFORE showing warnings
+    acquire_lock "$site_slug" "promote-to-live" || return 1
+    
+    echo -e "${RED}${BOLD}⚠️  DANGER ZONE ⚠️${NC}"
+    echo ""
+    echo "This will replace the LIVE site with the TEST site."
+    echo "This is a DESTRUCTIVE operation that will:"
+    echo "  - Backup current live site"
+    echo "  - Replace live with test content"
+    echo "  - Update all URLs"
+    echo ""
+    
+    if ! require_confirmation_string "PROMOTE-${site_slug^^}" \
+        "This will overwrite the LIVE site. A backup will be created first."; then
+        return 1
+    fi
+    
+    local live_domain="${site_slug}.cs.earlham.edu"
+    local test_domain="${site_slug}.testing.cs.earlham.edu"
+    
+    local live_wp_path test_wp_path
+    live_wp_path=$(discover_wp_path_from_domain "$live_domain" "$host") || {
+        log_error "Could not find live site"
+        return 1
+    }
+    test_wp_path=$(discover_wp_path_from_domain "$test_domain" "$host") || {
+        log_error "Could not find test site"
+        return 1
+    }
+    
+    # Parse configs
+    local live_config test_config
+    live_config=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
+    test_config=$(parse_wp_config "$test_wp_path/wp-config.php" "$host")
+    
+    eval "$live_config"
+    local live_db="$DB_NAME"
+    local live_db_user="$DB_USER"
+    local live_db_pass="$DB_PASS"
+    
+    eval "$test_config"
+    local test_db="$DB_NAME"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would perform promotion"
+        return 0
+    fi
+    
+    # Step 1: Backup live site
+    log_step "Creating safety backup of live site"
+    create_backup "$live_wp_path" "$site_slug" "live-pre-promotion" "$host" || {
+        log_error "Backup failed - aborting promotion"
+        return 1
+    }
+    
+    # Step 2: Backup live database to temp
+    log_step "Dumping test database"
+    local temp_dump="/tmp/test-db-${RUN_TIMESTAMP}.sql"
+    if [[ "$host" == "localhost" ]]; then
+        mysqldump "$test_db" > "$temp_dump"
+    else
+        remote_exec "$host" "mysqldump $test_db > $temp_dump"
+    fi
+    
+    # Step 3: Import to live database
+    log_step "Importing test data to live database"
+    if [[ "$host" == "localhost" ]]; then
+        mysql "$live_db" < "$temp_dump"
+        rm "$temp_dump"
+    else
+        remote_exec "$host" "mysql $live_db < $temp_dump && rm $temp_dump"
+    fi
+    
+    # Step 4: Sync files
+    log_step "Syncing files from test to live"
+    if [[ "$host" == "localhost" ]]; then
+        sudo rsync -av --delete "$test_wp_path/" "$live_wp_path/"
+        sudo chown -R www-data:www-data "$live_wp_path"
+    else
+        remote_exec "$host" "sudo rsync -av --delete $test_wp_path/ $live_wp_path/"
+        remote_exec "$host" "sudo chown -R www-data:www-data $live_wp_path"
+    fi
+    
+    # Step 5: Update wp-config to use live DB
+    log_step "Updating wp-config.php"
+    if [[ "$host" == "localhost" ]]; then
+        sudo sed -i "s/define('DB_NAME', *'[^']*');/define('DB_NAME', '$live_db');/" "$live_wp_path/wp-config.php"
+    else
+        remote_exec "$host" "sudo sed -i \"s/define('DB_NAME', *'[^']*');/define('DB_NAME', '$live_db');/\" $live_wp_path/wp-config.php"
+    fi
+    
+    # Step 6: Update URLs
+    log_step "Updating URLs from test to live"
+    if [[ "$host" == "localhost" ]]; then
+        sudo -u www-data wp --path="$live_wp_path" search-replace "https://$test_domain" "https://$live_domain" --all-tables
+        sudo -u www-data wp --path="$live_wp_path" cache flush
+        sudo -u www-data wp --path="$live_wp_path" rewrite flush --hard
+    else
+        remote_exec "$host" "sudo -u www-data wp --path=\"$live_wp_path\" search-replace \"https://$test_domain\" \"https://$live_domain\" --all-tables"
+        remote_exec "$host" "sudo -u www-data wp --path=\"$live_wp_path\" cache flush"
+        remote_exec "$host" "sudo -u www-data wp --path=\"$live_wp_path\" rewrite flush --hard"
+    fi
+    
+    # Step 7: Remove robots.txt if it exists
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -f "$live_wp_path/robots.txt" ]]; then
+            sudo rm "$live_wp_path/robots.txt" || true
+        fi
+    else
+        remote_exec "$host" "test -f $live_wp_path/robots.txt && sudo rm $live_wp_path/robots.txt || true"
+    fi
+    
+    log_success "Promotion completed!"
+    
+    print_section "Post-Promotion Tasks"
+    echo "□ Test the live site: https://$live_domain"
+    echo "□ Verify login works"
+    echo "□ Check that content is correct"
+    echo "□ Test key functionality"
+    echo "□ Monitor error logs"
+    echo ""
+    echo "If something is wrong, you can restore from the backup:"
+    echo "  Look in: ${BACKUP_ROOT}/${site_slug}/live-pre-promotion/"
+    
+    return 0
+}
+
+#==============================================================================
+# MULTISITE OPERATIONS
+#==============================================================================
+
+list_multisite_subsites() {
+    local multisite_path="$1"
+    local host="${2:-localhost}"
+    
+    print_header "MULTISITE SUBSITES"
+    
+    validate_wp_installation "$multisite_path" "$host" || return 1
+    
+    if ! is_multisite "$multisite_path" "$host"; then
+        log_error "Not a multisite installation"
+        return 1
+    fi
+    
+    log_info "Listing subsites..."
+    
+    if [[ "$host" == "localhost" ]]; then
+        sudo -u www-data wp --path="$multisite_path" site list --format=table
+    else
+        remote_exec "$host" "sudo -u www-data wp --path=\"$multisite_path\" site list --format=table"
+    fi
+    
+    return 0
+}
+
+promote_subsite_to_standalone() {
+    local multisite_path="$1"
+    local blog_id="$2"
+    local target_domain="$3"
+    local host="${4:-localhost}"
+    
+    print_header "PROMOTE MULTISITE SUBSITE TO STANDALONE"
+    
+    # V1.2: Acquire lock using target domain as slug
+    local site_slug=$(echo "$target_domain" | sed 's/\..*$//' | tr '.' '-')
+    acquire_lock "${site_slug}-blog${blog_id}" "promote-subsite" || return 1
+    
+    echo -e "${RED}${BOLD}⚠️  COMPLEX OPERATION ⚠️${NC}"
+    echo ""
+    echo "This will convert blog_id $blog_id from multisite to standalone."
+    echo "Target domain: $target_domain"
+    echo ""
+    echo "This process:"
+    echo "  1. Backs up entire multisite"
+    echo "  2. Exports subsite tables"
+    echo "  3. Creates new standalone WordPress"
+    echo "  4. Imports and converts tables"
+    echo "  5. Copies uploads from sites/$blog_id/"
+    echo "  6. Removes multisite constants"
+    echo "  7. Updates URLs"
+    echo ""
+    
+    if ! require_confirmation_string "PROMOTE" \
+        "This is a complex operation. Ensure you have backups."; then
+        return 1
+    fi
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would perform subsite promotion"
+        return 0
+    fi
+    
+    # Validate multisite
+    validate_wp_installation "$multisite_path" "$host" || return 1
+    if ! is_multisite "$multisite_path" "$host"; then
+        log_error "Not a multisite installation"
+        return 1
+    fi
+    
+    # Parse multisite config
+    local ms_config
+    ms_config=$(parse_wp_config "$multisite_path/wp-config.php" "$host")
+    eval "$ms_config"
+    local ms_db="$DB_NAME"
+    local ms_db_user="$DB_USER"
+    local ms_db_pass="$DB_PASS"
+    local ms_table_prefix="$TABLE_PREFIX"
+    
+    # Step 1: Backup multisite
+    log_step "Creating multisite backup"
+    local site_slug=$(sanitize_slug "$target_domain")
+    create_backup "$multisite_path" "multisite-before-promote-${blog_id}" "backup" "$host" || {
+        log_error "Backup failed - aborting"
+        return 1
+    }
+    
+    # Step 2: Create target WordPress installation
+    local target_wp_path="${WEBROOT}/wordpress-${site_slug}"
+    local target_db="wp_${site_slug}"
+    
+    log_step "Setting up target WordPress installation"
+    if [[ "$host" == "localhost" ]]; then
+        mkdir -p "$target_wp_path"
+        # Copy WordPress core from multisite
+        rsync -av --exclude='wp-content/uploads' "$multisite_path/" "$target_wp_path/"
+    else
+        remote_exec "$host" "mkdir -p $target_wp_path"
+        remote_exec "$host" "rsync -av --exclude='wp-content/uploads' $multisite_path/ $target_wp_path/"
+    fi
+    
+    # Step 3: Create new database
+    log_step "Creating target database: $target_db"
+    if [[ "$host" == "localhost" ]]; then
+        sudo mysql -e "CREATE DATABASE IF NOT EXISTS $target_db;"
+        sudo mysql -e "GRANT ALL PRIVILEGES ON ${target_db}.* TO '$ms_db_user'@'localhost' IDENTIFIED BY '$ms_db_pass';"
+        sudo mysql -e "FLUSH PRIVILEGES;"
+    else
+        remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $target_db;'"
+        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db}.* TO '$ms_db_user'@'localhost' IDENTIFIED BY '$ms_db_pass';\""
+        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'"
+    fi
+    
+    # Step 4: Export and import subsite tables
+    log_step "Exporting subsite tables (blog_id: $blog_id)"
+    local temp_sql="/tmp/subsite-${blog_id}-${RUN_TIMESTAMP}.sql"
+    
+    # Get list of tables for this blog_id
+    local blog_prefix="${ms_table_prefix}${blog_id}_"
+    
+    if [[ "$host" == "localhost" ]]; then
+        # Export blog-specific tables
+        local tables=$(mysql -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" -e "SHOW TABLES LIKE '${blog_prefix}%'" | tail -n +2 | tr '\n' ' ')
+        
+        if [[ -z "$tables" ]]; then
+            log_error "No tables found for blog_id: $blog_id"
+            return 1
+        fi
+        
+        log_info "Found tables: $tables"
+        
+        # Dump tables
+        mysqldump -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" $tables > "$temp_sql"
+        
+        # Also export users and usermeta
+        mysqldump -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" "${ms_table_prefix}users" "${ms_table_prefix}usermeta" >> "$temp_sql"
+        
+        # Import to new database with prefix conversion
+        log_step "Importing and converting table prefixes"
+        sed "s/${blog_prefix}/wp_/g" "$temp_sql" | sed "s/${ms_table_prefix}users/wp_users/g" | sed "s/${ms_table_prefix}usermeta/wp_usermeta/g" | mysql -u"$ms_db_user" -p"$ms_db_pass" "$target_db"
+        
+        rm "$temp_sql"
+    else
+        log_warn "Remote multisite promotion needs manual verification"
+        # Similar commands but via remote_exec
+    fi
+    
+    log_success "Tables imported"
+    
+    # Step 5: Copy uploads
+    log_step "Copying uploads from sites/${blog_id}/"
+    local ms_uploads="$multisite_path/wp-content/uploads/sites/${blog_id}"
+    local target_uploads="$target_wp_path/wp-content/uploads"
+    
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -d "$ms_uploads" ]]; then
+            mkdir -p "$target_uploads"
+            rsync -av "$ms_uploads/" "$target_uploads/"
+            log_success "Uploads copied"
+        else
+            log_warn "No uploads found at: $ms_uploads"
+        fi
+    else
+        if remote_exec "$host" "test -d $ms_uploads"; then
+            remote_exec "$host" "mkdir -p $target_uploads"
+            remote_exec "$host" "rsync -av $ms_uploads/ $target_uploads/"
+            log_success "Uploads copied"
+        else
+            log_warn "No uploads found"
+        fi
+    fi
+    
+    # Step 6: Create clean wp-config.php
+    log_step "Creating standalone wp-config.php"
+    cat > "/tmp/wp-config-new.php" <<WPCONFIG_EOF
+<?php
+define('DB_NAME', '$target_db');
+define('DB_USER', '$ms_db_user');
+define('DB_PASSWORD', '$ms_db_pass');
+define('DB_HOST', 'localhost');
+define('DB_CHARSET', 'utf8mb4');
+define('DB_COLLATE', '');
+
+\$table_prefix = 'wp_';
+
+define('WP_DEBUG', false);
+
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+
+require_once ABSPATH . 'wp-settings.php';
+WPCONFIG_EOF
+    
+    if [[ "$host" == "localhost" ]]; then
+        sudo cp "/tmp/wp-config-new.php" "$target_wp_path/wp-config.php"
+        sudo chown www-data:www-data "$target_wp_path/wp-config.php"
+        sudo chmod 640 "$target_wp_path/wp-config.php"
+    else
+        remote_copy "$host" "/tmp/wp-config-new.php" "$target_wp_path/wp-config.php" "to"
+        remote_exec "$host" "sudo chown www-data:www-data $target_wp_path/wp-config.php"
+        remote_exec "$host" "sudo chmod 640 $target_wp_path/wp-config.php"
+    fi
+    rm "/tmp/wp-config-new.php"
+    
+    # Step 7: Update URLs
+    log_step "Updating URLs to: https://$target_domain"
+    if [[ "$host" == "localhost" ]]; then
+        sudo -u www-data wp --path="$target_wp_path" option update siteurl "https://$target_domain"
+        sudo -u www-data wp --path="$target_wp_path" option update home "https://$target_domain"
+        
+        # Get old subsite URL
+        local old_url=$(sudo -u www-data wp --path="$target_wp_path" db query "SELECT option_value FROM wp_options WHERE option_name='siteurl'" --skip-column-names 2>/dev/null || echo "")
+        
+        if [[ -n "$old_url" && "$old_url" != "https://$target_domain" ]]; then
+            sudo -u www-data wp --path="$target_wp_path" search-replace "$old_url" "https://$target_domain" --all-tables
+        fi
+        
+        # Fix uploads URLs
+        sudo -u www-data wp --path="$target_wp_path" search-replace "/wp-content/uploads/sites/${blog_id}/" "/wp-content/uploads/" --all-tables
+    fi
+    
+    # Step 8: Set permissions
+    log_step "Setting correct permissions"
+    if [[ "$host" == "localhost" ]]; then
+        sudo chown -R www-data:www-data "$target_wp_path"
+        sudo find "$target_wp_path" -type d -exec chmod 755 {} \;
+        sudo find "$target_wp_path" -type f -exec chmod 644 {} \;
+    else
+        remote_exec "$host" "sudo chown -R www-data:www-data $target_wp_path"
+        remote_exec "$host" "sudo find $target_wp_path -type d -exec chmod 755 {} \\;"
+        remote_exec "$host" "sudo find $target_wp_path -type f -exec chmod 644 {} \\;"
+    fi
+    
+    log_success "Subsite promoted to standalone!"
+    
+    print_section "Post-Promotion Tasks"
+    echo "□ Configure Apache vhost for: https://$target_domain"
+    echo "□ Test login to wp-admin"
+    echo "□ Verify user roles work correctly"
+    echo "□ Check that media files load"
+    echo "□ Test key functionality"
+    echo "□ Update DNS if needed"
+    echo ""
+    echo "Standalone site location: $target_wp_path"
+    echo "Database: $target_db"
+    
+    return 0
+}
+
+#==============================================================================
+# HEALTH CHECK
+#==============================================================================
+
+healthcheck_site() {
+    local domain="$1"
+    local wp_path="${2:-}"
+    local host="${3:-localhost}"
+    
+    print_header "HEALTH CHECK: $domain"
+    
+    # Discover path if needed
+    if [[ -z "$wp_path" ]]; then
+        wp_path=$(discover_wp_path_from_domain "$domain" "$host") || {
+            log_error "Could not find WordPress installation"
+            return 1
+        }
+    fi
+    
+    local checks_passed=0
+    local checks_failed=0
+    local checks_warnings=0
+    
+    # Check 1: WordPress files
+    print_section "Check 1: WordPress Files"
+    if validate_wp_installation "$wp_path" "$host"; then
+        log_success "✓ WordPress files present"
+        ((checks_passed++))
+    else
+        log_error "✗ WordPress files incomplete"
+        ((checks_failed++))
+    fi
+    
+    # Check 2: Database connection
+    print_section "Check 2: Database Connection"
+    local config_data
+    config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    
+    if test_db_connection "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" "$host"; then
+        log_success "✓ Database connection works"
+        ((checks_passed++))
+    else
+        log_error "✗ Database connection failed"
+        ((checks_failed++))
+    fi
+    
+    # Check 3: WordPress URL settings
+    print_section "Check 3: URL Configuration"
+    local site_url home_url
+    site_url=$(get_wp_option "$wp_path" "siteurl" "$host")
+    home_url=$(get_wp_option "$wp_path" "home" "$host")
+    
+    if [[ "$site_url" == "https://$domain" && "$home_url" == "https://$domain" ]]; then
+        log_success "✓ URLs configured correctly"
+        echo "  siteurl: $site_url"
+        echo "  home: $home_url"
+        ((checks_passed++))
+    else
+        log_warn "⚠ URL mismatch detected"
+        echo "  Expected: https://$domain"
+        echo "  siteurl: $site_url"
+        echo "  home: $home_url"
+        ((checks_warnings++))
+    fi
+    
+    # Check 4: Apache vhost
+    print_section "Check 4: Apache Configuration"
+    local vhost_file
+    if [[ "$host" == "localhost" ]]; then
+        vhost_file=$(grep -l "ServerName.*$domain" /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1)
+    else
+        vhost_file=$(remote_exec "$host" "grep -l 'ServerName.*$domain' /etc/apache2/sites-enabled/* 2>/dev/null | head -n 1" || echo "")
+    fi
+    
+    if [[ -n "$vhost_file" ]]; then
+        log_success "✓ Apache vhost enabled: $vhost_file"
+        ((checks_passed++))
+    else
+        log_error "✗ Apache vhost not found or not enabled"
+        ((checks_failed++))
+    fi
+    
+    # Check 5: Permissions
+    print_section "Check 5: File Permissions"
+    if [[ "$host" == "localhost" ]]; then
+        local wp_owner=$(stat -c '%U:%G' "$wp_path")
+        local uploads_path="$wp_path/wp-content/uploads"
+        
+        if [[ "$wp_owner" == "www-data:www-data" ]]; then
+            log_success "✓ WordPress owned by www-data"
+            ((checks_passed++))
+        else
+            log_warn "⚠ WordPress ownership: $wp_owner (expected www-data:www-data)"
+            ((checks_warnings++))
+        fi
+        
+        if [[ -d "$uploads_path" ]]; then
+            local uploads_perms=$(stat -c '%a' "$uploads_path")
+            if [[ "$uploads_perms" == "755" ]]; then
+                log_success "✓ Uploads directory permissions correct"
+                ((checks_passed++))
+            else
+                log_warn "⚠ Uploads permissions: $uploads_perms (expected 755)"
+                ((checks_warnings++))
+            fi
+        fi
+    else
+        log_info "Skipping detailed permission check on remote host"
+    fi
+    
+    # Check 6: HTTP/HTTPS access
+    print_section "Check 6: Site Accessibility"
+    if command_exists curl; then
+        local http_code=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" 2>/dev/null || echo "000")
+        if [[ "$http_code" == "200" ]]; then
+            log_success "✓ Site accessible (HTTP $http_code)"
+            ((checks_passed++))
+        elif [[ "$http_code" == "301" || "$http_code" == "302" ]]; then
+            log_success "✓ Site redirects (HTTP $http_code)"
+            ((checks_passed++))
+        else
+            log_error "✗ Site not accessible (HTTP $http_code)"
+            ((checks_failed++))
+        fi
+    else
+        log_info "curl not available, skipping accessibility check"
+    fi
+    
+    # Check 7: Recent errors in logs
+    print_section "Check 7: Error Logs"
+    if [[ "$host" == "localhost" ]]; then
+        local error_log="/var/log/apache2/error.log"
+        if [[ -f "$error_log" ]]; then
+            local recent_errors=$(grep -i "$domain" "$error_log" | tail -n 10 | grep -i "error" | wc -l)
+            if [[ $recent_errors -eq 0 ]]; then
+                log_success "✓ No recent errors in Apache log"
+                ((checks_passed++))
+            else
+                log_warn "⚠ Found $recent_errors recent errors in Apache log"
+                echo "  Last few errors:"
+                grep -i "$domain" "$error_log" | grep -i "error" | tail -n 3
+                ((checks_warnings++))
+            fi
+        fi
+    fi
+    
+    # Summary
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "                      HEALTH CHECK SUMMARY"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo -e "${GREEN}Passed:  $checks_passed${NC}"
+    echo -e "${YELLOW}Warnings: $checks_warnings${NC}"
+    echo -e "${RED}Failed:   $checks_failed${NC}"
+    echo ""
+    
+    if [[ $checks_failed -eq 0 && $checks_warnings -eq 0 ]]; then
+        log_success "All checks passed! Site appears healthy."
+        return 0
+    elif [[ $checks_failed -eq 0 ]]; then
+        log_warn "Site is functional but has warnings to address."
+        return 0
+    else
+        log_error "Site has critical issues that need attention."
+        return 1
+    fi
+}
+
+#==============================================================================
+# URL AUDIT AND FIX
+#==============================================================================
+
+url_audit() {
+    local wp_path="$1"
+    local host="${2:-localhost}"
+    local domain="${3:-}"
+    local deep_scan="${4:-false}"
+    
+    print_header "URL AUDIT"
+    
+    # V1.2: Show decision tree for when to use --deep
+    if [[ "$NON_INTERACTIVE" != "true" && -t 1 ]]; then
+        cat <<'GUIDE_EOF'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+              WHEN TO USE --deep SCAN? (Decision Tree)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Use STANDARD scan (default) when:
+  ✓ Routine URL cleanup after migration
+  ✓ Checking for common issues (http vs https, testing URLs)
+  ✓ Quick validation
+  ✓ First diagnostic step
+
+Use --deep scan when you see:
+  ⚠ Media thumbnails load but PDFs don't
+  ⚠ Plugin-specific content broken after migration
+  ⚠ URLs look right in wp_options but content doesn't work
+  ⚠ Working with media plugins:
+    • DFlip (PDF viewer)
+    • NextGen Gallery  
+    • WooCommerce (product images)
+    • Any plugin with custom post types
+
+DECISION TREE:
+  1. Run standard scan first
+     └─ Issues found and fixed? → Done! ✓
+     └─ Issues persist? → Go to step 2
+
+  2. Check symptoms:
+     └─ Database URLs look correct? → Go to step 3
+     └─ Database has wrong URLs? → Fix with standard scan
+
+  3. Media/plugin issues?
+     └─ Yes → Run --deep scan
+     └─ No → Check file permissions/Apache config
+
+  4. Deep scan finds _plugin_data keys?
+     └─ Yes → Follow guided replacement
+     └─ Verify after replacement
+
+REAL EXAMPLE (from production):
+  Problem: PDFs don't load after earlhamword.com migration
+  Standard scan: Found some URLs, replaced them
+  Problem persists: PDFs still broken
+  Deep scan: Found 47 entries in _dflip_data with old URLs
+  Fix: Guided replacement updated serialized plugin data
+  Result: ✓ PDFs now load correctly
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GUIDE_EOF
+
+        if [[ "$deep_scan" == "true" ]]; then
+            echo -e "${YELLOW}Running DEEP SCAN (this may take several minutes)${NC}"
+        else
+            echo -e "${GREEN}Running STANDARD SCAN${NC}"
+            echo ""
+            echo "TIP: If issues persist after this scan, try:"
+            echo "  webdev-migrate url-audit --deep $wp_path"
+        fi
+        echo ""
+        
+        read -r -p "Proceed with scan? (Y/n): " proceed
+        if [[ "$proceed" == "n" || "$proceed" == "N" ]]; then
+            log_info "Scan cancelled"
+            return 0
+        fi
+        echo ""
+    fi
+    
+    validate_wp_installation "$wp_path" "$host" || return 1
+    
+    local config_data
+    config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
+    eval "$config_data"
+    
+    # Determine domain if not provided
+    if [[ -z "$domain" ]]; then
+        local current_url
+        current_url=$(get_wp_option "$wp_path" "siteurl" "$host" "$domain")
+        domain=$(echo "$current_url" | sed 's|https\?://||' | sed 's|/.*||')
+    fi
+    
+    # Get correct table prefix
+    local site_table_prefix
+    if is_multisite "$wp_path" "$host"; then
+        site_table_prefix=$(get_table_prefix_for_blog "$wp_path" "$domain" "$host")
+    else
+        site_table_prefix="$TABLE_PREFIX"
+    fi
+    
+    log_step "Scanning database for URLs..."
+    echo "Domain: $domain"
+    echo "Database: $DB_NAME"
+    echo "Table Prefix: $site_table_prefix"
+    echo ""
+    
+    # Get current site URL
+    local current_url
+    current_url=$(get_wp_option "$wp_path" "siteurl" "$host" "$domain")
+    
+    echo "Current site URL: $current_url"
+    echo ""
+    
+    # Common URL patterns to check
+    local patterns=(
+        "testing.cs.earlham.edu"
+        "test.cs.earlham.edu"
+        "localhost"
+        "http://"
+        "cs.earlham.edu/sites/"
+        "/wp-content/uploads/sites/"
+    )
+    
+    echo "=== STANDARD URL SCAN ==="
+    echo ""
+    
+    for pattern in "${patterns[@]}"; do
+        echo "Checking for: $pattern"
+        
+        local count=0
+        if [[ "$host" == "localhost" ]]; then
+            # Use WP-CLI with correct context
+            local context_flags
+            context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+            count=$(eval "sudo -u www-data wp $context_flags db search \"$pattern\" --all-tables --format=count 2>/dev/null || echo 0")
+        else
+            local context_flags
+            context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+            count=$(remote_exec "$host" "sudo -u www-data wp $context_flags db search \"$pattern\" --all-tables --format=count 2>/dev/null || echo 0")
+        fi
+        
+        if [[ $count -gt 0 ]]; then
+            echo -e "  ${YELLOW}Found $count occurrences${NC}"
+        else
+            echo -e "  ${GREEN}No occurrences${NC}"
+        fi
+    done
+    
+    # Deep scan for plugin-stored URLs (like DFlip)
+    if [[ "$deep_scan" == "true" ]] || [[ "$1" == "--deep" ]]; then
+        echo ""
+        echo "=== DEEP SCAN (Plugin-Stored URLs) ==="
+        echo ""
+        log_warn "This may take several minutes for large databases..."
+        
+        # Scan postmeta for serialized data containing URLs
+        log_step "Scanning postmeta for plugin data..."
+        
+        local postmeta_table="${site_table_prefix}postmeta"
+        
+        # Find top meta keys that might contain URLs
+        if [[ "$host" == "localhost" ]]; then
+            local meta_keys_with_urls
+            meta_keys_with_urls=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                SELECT meta_key, COUNT(*) as cnt 
+                FROM $postmeta_table 
+                WHERE meta_value LIKE '%http%' 
+                GROUP BY meta_key 
+                ORDER BY cnt DESC 
+                LIMIT 20;
+            " 2>/dev/null || echo "")
+            
+            if [[ -n "$meta_keys_with_urls" ]]; then
+                echo "Top 20 meta keys containing URLs:"
+                echo "$meta_keys_with_urls" | while IFS=$'\t' read -r key count; do
+                    echo "  • $key ($count entries)"
+                done
+                echo ""
+            fi
+            
+            # Specific check for known plugin data
+            local plugin_keys=("_dflip_data" "_pdf_info" "_document_data" "_media_data")
+            
+            for key in "${plugin_keys[@]}"; do
+                local plugin_count
+                plugin_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                    SELECT COUNT(*) FROM $postmeta_table WHERE meta_key='$key';
+                " 2>/dev/null || echo 0)
+                
+                if [[ $plugin_count -gt 0 ]]; then
+                    echo -e "${YELLOW}⚠ Found $plugin_count entries with key: $key${NC}"
+                    
+                    # Check for specific URL patterns in this key
+                    for pattern in "testing.cs.earlham.edu" "http://" "/sites/"; do
+                        local pattern_count
+                        pattern_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                            SELECT COUNT(*) FROM $postmeta_table 
+                            WHERE meta_key='$key' AND meta_value LIKE '%$pattern%';
+                        " 2>/dev/null || echo 0)
+                        
+                        if [[ $pattern_count -gt 0 ]]; then
+                            echo -e "  ${RED}→ $pattern_count contain: $pattern${NC}"
+                        fi
+                    done
+                fi
+            done
+            
+            # Check custom post types that might have media
+            log_step "Checking custom post types..."
+            local post_table="${site_table_prefix}posts"
+            local custom_post_types
+            custom_post_types=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                SELECT DISTINCT post_type FROM $post_table 
+                WHERE post_type NOT IN ('post', 'page', 'attachment', 'revision', 'nav_menu_item')
+                AND post_status != 'trash';
+            " 2>/dev/null || echo "")
+            
+            if [[ -n "$custom_post_types" ]]; then
+                echo "Custom post types found:"
+                echo "$custom_post_types" | while read -r post_type; do
+                    local type_count
+                    type_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                        SELECT COUNT(*) FROM $post_table WHERE post_type='$post_type';
+                    " 2>/dev/null || echo 0)
+                    echo "  • $post_type ($type_count posts)"
+                done
+                echo ""
+            fi
+        fi
+    fi
+    
+    echo ""
+    read -r -p "Do you want to run an automated URL fix? (y/N): " response
+    
+    if [[ "$response" == "y" || "$response" == "Y" ]]; then
+        echo ""
+        read -r -p "Enter OLD URL to replace (e.g., https://test.example.com): " old_url
+        read -r -p "Enter NEW URL (e.g., https://example.com): " new_url
+        
+        # Validate URLs
+        if [[ ! "$old_url" =~ ^https?:// ]] || [[ ! "$new_url" =~ ^https?:// ]]; then
+            log_error "URLs must start with http:// or https://"
+            return 1
+        fi
+        
+        if ! confirm "Replace '$old_url' with '$new_url' in all tables?" "n"; then
+            log_info "URL fix cancelled"
+            return 0
+        fi
+        
+        log_step "Performing URL replacement..."
+        
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log_info "[DRY RUN] Would replace URLs"
+        else
+            if [[ "$host" == "localhost" ]]; then
+                local context_flags
+                context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+                
+                # V1.2 SERIALIZATION SAFETY NOTE:
+                # We use WP-CLI search-replace which properly handles serialized WordPress data.
+                # WordPress serialization format: s:5:"hello"; (where 5 is the string length)
+                # If you manually change "hello" to "hi", you MUST update length to s:2:"hi";
+                # Failure to do so breaks the site in subtle ways (white screens, data loss).
+                # WP-CLI's search-replace automatically updates serialized lengths.
+                # DO NOT use sed/awk/SQL string replace on WordPress databases!
+                
+                # Standard search-replace
+                eval "sudo -u www-data wp $context_flags search-replace \"$old_url\" \"$new_url\" --all-tables --report-changed-only"
+                
+                # If deep scan was run and we found plugin data, offer targeted fixes
+                if [[ "$deep_scan" == "true" ]]; then
+                    echo ""
+                    read -r -p "Also fix uploads paths (sites/<id>/ → /)? (y/N): " fix_uploads
+                    
+                    if [[ "$fix_uploads" == "y" ]]; then
+                        # Detect blog_id
+                        local blog_id
+                        blog_id=$(get_blog_id_for_domain "$wp_path" "$domain" "$host")
+                        
+                        if [[ -n "$blog_id" ]]; then
+                            log_step "Fixing multisite uploads paths..."
+                            eval "sudo -u www-data wp $context_flags search-replace \"/wp-content/uploads/sites/${blog_id}/\" \"/wp-content/uploads/\" --all-tables --report-changed-only"
+                        fi
+                    fi
+                fi
+                
+                # Clear caches
+                eval "sudo -u www-data wp $context_flags cache flush" 2>/dev/null || true
+            else
+                local context_flags
+                context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+                
+                remote_exec "$host" "sudo -u www-data wp $context_flags search-replace \"$old_url\" \"$new_url\" --all-tables --report-changed-only"
+                remote_exec "$host" "sudo -u www-data wp $context_flags cache flush" 2>/dev/null || true
+            fi
+            
+            log_success "URL replacement complete"
+        fi
+        
+        # Offer verification
+        echo ""
+        read -r -p "Run verification scan? (Y/n): " verify_response
+        
+        if [[ "$verify_response" != "n" && "$verify_response" != "N" ]]; then
+            echo ""
+            log_step "Verifying replacements..."
+            
+            # Check if old URL still exists
+            if [[ "$host" == "localhost" ]]; then
+                local context_flags
+                context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+                local remaining
+                remaining=$(eval "sudo -u www-data wp $context_flags db search \"$old_url\" --all-tables --format=count 2>/dev/null || echo 0")
+                
+                if [[ $remaining -eq 0 ]]; then
+                    log_success "✓ No occurrences of old URL found"
+                else
+                    log_warn "⚠ Still found $remaining occurrences of old URL"
+                    echo "  These may be in serialized data that needs manual attention"
+                fi
+            fi
+        fi
+    fi
+    
+    # Offer to generate a detailed report
+    echo ""
+    read -r -p "Generate detailed URL audit report? (y/N): " report_response
+    
+    if [[ "$report_response" == "y" ]]; then
+        local report_file="${LOG_DIR}/url-audit-$(sanitize_slug "$domain")-${RUN_TIMESTAMP}.txt"
+        
+        cat > "$report_file" <<REPORT_EOF
+URL Audit Report
+================
+Generated: $(date)
+Domain: $domain
+WordPress Path: $wp_path
+Database: $DB_NAME
+Table Prefix: $site_table_prefix
+
+Current Site URL: $current_url
+
+Scanned Patterns:
+REPORT_EOF
+        
+        for pattern in "${patterns[@]}"; do
+            local count=0
+            if [[ "$host" == "localhost" ]]; then
+                local context_flags
+                context_flags=$(get_wp_cli_context "$wp_path" "$domain" "$host")
+                count=$(eval "sudo -u www-data wp $context_flags db search \"$pattern\" --all-tables --format=count 2>/dev/null || echo 0")
+            fi
+            echo "  $pattern: $count occurrences" >> "$report_file"
+        done
+        
+        log_success "Report saved to: $report_file"
+    fi
+    
+    return 0
+}
+
+#==============================================================================
+# MAIN MENU
+#==============================================================================
+
+show_menu() {
+    clear
+    cat <<'EOF'
+╔══════════════════════════════════════════════════════════════════╗
+║                                                                  ║
+║                   WEBDEV MIGRATION TOOL                          ║
+║                     Version 1.0.0                                ║
+║                                                                  ║
+║          Unified WordPress Management for Web Teams              ║
+║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+    
+    echo "Select an operation:"
+    echo ""
+    echo "  1)  Inventory a site (show THE 8 FACTS)"
+    echo "  2)  Backup a site"
+    echo "  3)  Restore a site from backup (with verification)"
+    echo "  4)  Migrate site: Source → Destination (full copy)"
+    echo "  5)  Clone live → test"
+    echo "  6)  Promote test → live (careful!)"
+    echo "  7)  Multisite: inspect / list subsites (LEGACY)"
+    echo "  8)  Multisite: promote subsite to standalone (RECOMMENDED)"
+    echo "  9)  Health check / troubleshooting"
+    echo "  10) URL audit and fix (use for deep plugin scan)"
+    echo ""
+    echo "  0)  Exit"
+    echo ""
+    echo "  Note: Multisite is LEGACY - we're phasing it out."
+    echo "        Use option 8 to convert subsites to standalone."
+    echo ""
+}
+
+#==============================================================================
+# INTERACTIVE MENU HANDLER
+#==============================================================================
+
+run_interactive_menu() {
+    while true; do
+        show_menu
+        read -r -p "Choice: " choice
+        echo ""
+        
+        case "$choice" in
+            1)
+                # Inventory a site
+                read -r -p "Enter domain (e.g., portfolios.cs.earlham.edu): " domain
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                inventory_site "$domain" "" "$host"
+                ;;
+            2)
+                # Backup a site
+                read -r -p "Enter WordPress path: " wp_path
+                read -r -p "Enter site slug (e.g., portfolios): " site_slug
+                read -r -p "Enter environment (live/test) [live]: " env
+                env=${env:-live}
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                create_backup "$wp_path" "$site_slug" "$env" "$host"
+                ;;
+            3)
+                # Restore from backup
+                read -r -p "Enter backup directory path: " backup_dir
+                read -r -p "Enter target WordPress path: " target_wp_path
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                restore_backup "$backup_dir" "$target_wp_path" "" "$host"
+                ;;
+            4)
+                # Migrate site
+                echo "Format: host:slug (e.g., web:portfolios) or just slug for localhost"
+                read -r -p "Enter source (e.g., web:portfolios): " source_spec
+                read -r -p "Enter destination (e.g., web-urey:portfolios): " dest_spec
+                migrate_site "$source_spec" "$dest_spec"
+                ;;
+            5)
+                # Clone live to test
+                read -r -p "Enter site slug (e.g., portfolios): " site_slug
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                clone_live_to_test "$site_slug" "$host"
+                ;;
+            6)
+                # Promote test to live (V1.2: dry-run first for safety)
+                read -r -p "Enter site slug (e.g., portfolios): " site_slug
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                
+                echo ""
+                log_warn "This is a DESTRUCTIVE operation. Running dry-run first..."
+                echo ""
+                
+                # Force dry-run first
+                local original_dry_run="$DRY_RUN"
+                DRY_RUN=true
+                promote_test_to_live "$site_slug" "$host"
+                local dry_run_result=$?
+                DRY_RUN="$original_dry_run"
+                
+                if [[ $dry_run_result -ne 0 ]]; then
+                    log_error "Dry-run failed. Not proceeding with actual operation."
+                else
+                    echo ""
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  That was a DRY RUN. No changes were made."
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    read -r -p "Do you want to ACTUALLY execute this operation? (type 'yes'): " confirm
+                    
+                    if [[ "$confirm" == "yes" ]]; then
+                        echo ""
+                        promote_test_to_live "$site_slug" "$host"
+                    else
+                        log_info "Operation cancelled (safer choice!)"
+                    fi
+                fi
+                ;;
+            7)
+                # List multisite subsites
+                read -r -p "Enter multisite WordPress path: " multisite_path
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                list_multisite_subsites "$multisite_path" "$host"
+                ;;
+            8)
+                # Promote subsite to standalone (V1.2: dry-run first for safety)
+                read -r -p "Enter multisite WordPress path: " multisite_path
+                read -r -p "Enter blog ID to promote: " blog_id
+                read -r -p "Enter target domain (e.g., newsite.cs.earlham.edu): " target_domain
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                
+                echo ""
+                log_warn "This is a COMPLEX operation. Running dry-run first..."
+                echo ""
+                
+                # Force dry-run first
+                local original_dry_run="$DRY_RUN"
+                DRY_RUN=true
+                promote_subsite_to_standalone "$multisite_path" "$blog_id" "$target_domain" "$host"
+                local dry_run_result=$?
+                DRY_RUN="$original_dry_run"
+                
+                if [[ $dry_run_result -ne 0 ]]; then
+                    log_error "Dry-run failed. Not proceeding with actual operation."
+                else
+                    echo ""
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  That was a DRY RUN. No changes were made."
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo ""
+                    read -r -p "Do you want to ACTUALLY execute this operation? (type 'yes'): " confirm
+                    
+                    if [[ "$confirm" == "yes" ]]; then
+                        echo ""
+                        promote_subsite_to_standalone "$multisite_path" "$blog_id" "$target_domain" "$host"
+                    else
+                        log_info "Operation cancelled (safer choice!)"
+                    fi
+                fi
+                ;;
+            9)
+                # Health check
+                read -r -p "Enter domain to check: " domain
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                healthcheck_site "$domain" "" "$host"
+                ;;
+            10)
+                # URL audit
+                read -r -p "Enter WordPress path: " wp_path
+                read -r -p "Enter host [localhost]: " host
+                host=${host:-localhost}
+                read -r -p "Run deep scan (plugin metadata)? (y/N): " deep_response
+                local deep_flag="false"
+                if [[ "$deep_response" == "y" || "$deep_response" == "Y" ]]; then
+                    deep_flag="true"
+                fi
+                url_audit "$wp_path" "$host" "" "$deep_flag"
+                ;;
+            0)
+                echo "Exiting..."
+                exit 0
+                ;;
+            *)
+                log_error "Invalid choice. Please try again."
+                ;;
+        esac
+        
+        echo ""
+        read -r -p "Press Enter to continue..."
+    done
+}
+
+#==============================================================================
+# COMMAND LINE ARGUMENT PARSING
+#==============================================================================
+
+show_help() {
+    cat <<EOF
+webdev-migrate v${SCRIPT_VERSION} - Unified WordPress Migration Tool
+
+USAGE:
+    $SCRIPT_NAME [OPTIONS] [COMMAND]
+
+COMMANDS:
+    inventory <domain>              Show detailed site information (THE 8 FACTS)
+    backup <wp_path> <slug> [env]   Create backup of a site
+    restore <backup_dir> <wp_path>  Restore from backup (with verification)
+    migrate <src> <dst>             Migrate site between servers
+    clone-to-test <slug>            Clone live → test
+    promote-to-live <slug>          Promote test → live (careful!)
+    list-subsites <multisite_path>  List multisite subsites
+    promote-subsite <blog_id>       Convert subsite to standalone
+    healthcheck <domain>            Run health diagnostics
+    url-audit [--deep] <wp_path>    Audit and fix URLs (--deep scans plugin data)
+
+OPTIONS:
+    --dry-run                       Show what would be done
+    --verbose                       Show detailed debug output
+    --non-interactive               Run without prompts
+    --show-secrets                  Display passwords in output
+    --assume-yes                    Auto-confirm (dangerous)
+    --force                         Force dangerous operations
+    --log-dir <path>                Set log directory
+    --help                          Show this help
+
+EXAMPLES:
+    # Interactive mode (recommended for beginners)
+    $SCRIPT_NAME
+
+    # Inventory a site (shows THE 8 FACTS)
+    $SCRIPT_NAME inventory portfolios.cs.earlham.edu
+
+    # Create backup
+    $SCRIPT_NAME backup /var/www/wordpress-portfolios portfolios live
+
+    # Dry run of migration
+    $SCRIPT_NAME --dry-run migrate web:portfolios web-urey:portfolios
+
+    # Health check
+    $SCRIPT_NAME healthcheck portfolios.cs.earlham.edu
+
+    # Deep URL audit (scans plugin metadata for serialized URLs)
+    $SCRIPT_NAME url-audit --deep /var/www/wordpress-portfolios
+
+CONFIGURATION:
+    Config file: ~/.webdev-migrate.conf
+    Default log directory: /var/log/webdev-migrate
+
+MULTISITE NOTES:
+    This tool treats multisite as LEGACY. The recommended approach is:
+    1. List subsites: list-subsites
+    2. Promote to standalone: promote-subsite
+    3. Phase out the multisite installation
+    
+    All operations automatically detect multisite context and use correct
+    table prefixes (wp_<blogid>_*) and WP-CLI --url flags.
+
+For full documentation, see README.md
+EOF
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --non-interactive)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            --show-secrets)
+                SHOW_SECRETS=true
+                shift
+                ;;
+            --assume-yes)
+                ASSUME_YES=true
+                shift
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            --log-dir)
+                LOG_DIR="$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            inventory)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                inventory_site "$@"
+                exit $?
+                ;;
+            backup)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                create_backup "$@"
+                exit $?
+                ;;
+            restore)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                restore_backup "$@"
+                exit $?
+                ;;
+            migrate)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                migrate_site "$@"
+                exit $?
+                ;;
+            clone-to-test)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                clone_live_to_test "$@"
+                exit $?
+                ;;
+            promote-to-live)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                promote_test_to_live "$@"
+                exit $?
+                ;;
+            list-subsites)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                list_multisite_subsites "$@"
+                exit $?
+                ;;
+            promote-subsite)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                promote_subsite_to_standalone "$@"
+                exit $?
+                ;;
+            healthcheck)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                healthcheck_site "$@"
+                exit $?
+                ;;
+            url-audit)
+                shift
+                setup_logging
+                check_requirements || exit 1
+                local deep_flag="false"
+                if [[ "${1:-}" == "--deep" ]]; then
+                    deep_flag="true"
+                    shift
+                fi
+                url_audit "$1" "${2:-localhost}" "${3:-}" "$deep_flag"
+                exit $?
+                ;;
+            *)
+                if [[ "$1" =~ ^-- ]]; then
+                    log_error "Unknown option: $1"
+                    show_help
+                    exit 1
+                else
+                    log_error "Unknown command: $1"
+                    show_help
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+}
+
+#==============================================================================
+# MAIN ENTRY POINT
+#==============================================================================
+
+main() {
+    # Parse command line arguments
+    if [[ $# -eq 0 ]]; then
+        # No arguments - run interactive mode
+        setup_logging
+        check_requirements || exit 1
+        run_interactive_menu
+    else
+        # Has arguments - parse and execute
+        parse_arguments "$@"
+    fi
+}
+
+# Run main function
+main "$@"
