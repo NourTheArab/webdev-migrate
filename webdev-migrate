@@ -3048,6 +3048,7 @@ check_sudo_available() {
 #==============================================================================
 
 list_all_sites() {
+    set +e  # Disable strict error checking for site scanning
     local host="${1:-localhost}"
     
     print_header "SITES ON THIS SERVER"
@@ -3093,9 +3094,9 @@ list_all_sites() {
         local apache_conf=""
         if [[ "$host" == "localhost" ]]; then
             # Find Apache config that points to this DocumentRoot
-            apache_conf=$(grep -rl "DocumentRoot.*$(echo "$wp_path" | sed 's/[.[\*^$()+?{|]/\\&/g')" /etc/apache2/sites-enabled/ 2>/dev/null | head -n 1)
+            apache_conf=$(grep -rl "DocumentRoot.*$(echo "$wp_path" | sed 's/[.[\*^$()+?{|]/\\&/g')" /etc/apache2/sites-enabled/ 2>/dev/null | head -n 1 || true)
             if [[ -n "$apache_conf" ]]; then
-                domain=$(grep -i "ServerName" "$apache_conf" 2>/dev/null | head -n 1 | awk '{print $2}')
+		domain=$(grep -i "ServerName" "$apache_conf" 2>/dev/null | head -n 1 | awk '{print $2}' || true)
             fi
         else
             apache_conf=$(remote_exec "$host" "grep -rl 'DocumentRoot.*$wp_path' /etc/apache2/sites-enabled/ 2>/dev/null | head -n 1")
@@ -3199,6 +3200,7 @@ list_all_sites() {
     echo ""
     
     return 0
+    set -e  # Re-enable strict error checking
 }
 
 #==============================================================================
