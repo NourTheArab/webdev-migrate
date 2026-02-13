@@ -1,0 +1,114 @@
+# webdev-migrate Configuration File
+# Copy this to ~/.webdev-migrate.conf and customize for your environment
+
+# =============================================================================
+# Server Configuration
+# =============================================================================
+
+# Default source server (old server)
+SOURCE_HOST="web"
+
+# Default destination server (new server)
+DEST_HOST="web-urey"
+
+# SSH user for remote operations
+# This should be a user with sudo privileges
+SSH_USER="root"
+
+# =============================================================================
+# Path Configuration
+# =============================================================================
+
+# Web root directory where WordPress installations live
+# Standard: /var/www
+WEBROOT="/var/www"
+
+# Backup storage root
+# All backups will be stored under this directory
+# Structure: $BACKUP_ROOT/{site-slug}/{environment}/{timestamp}/
+BACKUP_ROOT="/srv/backups/wp"
+
+# Log directory for webdev-migrate operations
+# Each run creates a timestamped log file here
+LOG_DIR="/var/log/webdev-migrate"
+
+# =============================================================================
+# Operational Defaults
+# =============================================================================
+
+# Uncomment these lines to change default behavior
+# (Generally not recommended - override on command line instead)
+
+# DRY_RUN=false           # Set true to default to dry-run mode
+# VERBOSE=false           # Set true for verbose output by default
+# SHOW_SECRETS=false      # Set true to show passwords (INSECURE)
+# NON_INTERACTIVE=false   # Set true for automation (careful!)
+
+# =============================================================================
+# Site-Specific Settings (Optional)
+# =============================================================================
+
+# You can define site-specific settings here
+# Example:
+
+# Portfolio site on production
+# PORTFOLIOS_LIVE_PATH="/var/www/wordpress-portfolios"
+# PORTFOLIOS_LIVE_DB="wp_portfolios"
+# PORTFOLIOS_LIVE_DOMAIN="portfolios.cs.earlham.edu"
+
+# Portfolio site on testing
+# PORTFOLIOS_TEST_PATH="/var/www/wordpress-testing-portfolios"
+# PORTFOLIOS_TEST_DB="wp_testing_portfolios"
+# PORTFOLIOS_TEST_DOMAIN="portfolios.testing.cs.earlham.edu"
+
+# =============================================================================
+# Backup Retention (Future)
+# =============================================================================
+
+# These settings are for future implementation
+# BACKUP_RETENTION_DAYS=30        # Keep backups for 30 days
+# BACKUP_MAX_COUNT=10             # Keep max 10 backups per site/env
+
+# =============================================================================
+# Advanced Settings
+# =============================================================================
+
+# MySQL command (if non-standard location)
+# MYSQL_CMD="/usr/bin/mysql"
+# MYSQLDUMP_CMD="/usr/bin/mysqldump"
+
+# WP-CLI command (if non-standard location)
+# WP_CLI_CMD="/usr/local/bin/wp"
+
+# Apache control commands
+# APACHE_CTL="apache2ctl"
+# A2ENSITE="a2ensite"
+# A2DISSITE="a2dissite"
+# SYSTEMCTL="systemctl"
+
+# =============================================================================
+# Environment-Specific Overrides
+# =============================================================================
+
+# You can set different configs based on hostname
+# This is useful if you run the tool on different machines
+
+# if [[ "$(hostname)" == "web" ]]; then
+#     SOURCE_HOST="localhost"
+#     DEST_HOST="web-urey"
+# elif [[ "$(hostname)" == "web-urey" ]]; then
+#     SOURCE_HOST="web"
+#     DEST_HOST="localhost"
+# fi
+
+# =============================================================================
+# Notes
+# =============================================================================
+
+# This file is sourced by the webdev-migrate script at startup
+# You can use any bash syntax here
+# Variables set here override built-in defaults
+# Command-line flags override both defaults and config file
+
+# Security note: Keep this file readable only by your user
+# chmod 600 ~/.webdev-migrate.conf
