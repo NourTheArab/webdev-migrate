@@ -2,9 +2,10 @@
 
 #==============================================================================
 # webdev-migrate: Unified WordPress Migration & Management Tool
-# Version: 1.2.0
+# Version: 1.2.1
 # Description: Complete WordPress site management for university web teams
 #              Handles backup, restore, migration, cloning, and multisite conversions
+#              V1.2.1: Beginner UX improvements (site discovery, inline help, sudo check)
 #==============================================================================
 
 set -eo pipefail
@@ -13,7 +14,7 @@ set -eo pipefail
 # GLOBAL CONFIGURATION
 #==============================================================================
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_TIME=$(date +%s)
@@ -1547,8 +1548,8 @@ restore_backup() {
     local db_user db_pass db_host
     if [[ -n "$target_db_name" ]]; then
         read -r -p "Enter database user: " db_user
-        read -r -sp "Enter database password: " db_pass
-        echo ""
+        # V1.2.1: Use password helper
+        get_db_password_with_help "$target_wp_path" "db_pass"
         db_host="localhost"
     else
         # Try to read from wp-config backup
@@ -1771,7 +1772,6 @@ restore_backup() {
     fi
     
     return 0
-}
 }
 
 #==============================================================================
@@ -3006,16 +3006,365 @@ REPORT_EOF
 }
 
 #==============================================================================
+# V1.2.1 - SUDO CHECK
+#==============================================================================
+
+check_sudo_available() {
+    if is_root; then
+        log_debug "Running as root"
+        return 0
+    fi
+    
+    if sudo -n true 2>/dev/null; then
+        log_debug "Passwordless sudo available"
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  ⚠️  SUDO NOT DETECTED${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo "  Most operations require sudo privileges."
+    echo ""
+    echo "  Recommended: Exit and re-run with sudo:"
+    echo -e "    ${BOLD}sudo webdev-migrate${NC}"
+    echo ""
+    echo "  Some read-only operations (like listing sites) may still work."
+    echo ""
+    
+    local response
+    read -r -p "  Continue without sudo? (y/N): " response
+    if [[ "$response" != "y" && "$response" != "Y" ]]; then
+        echo ""
+        echo "  Exiting. Run again with: sudo webdev-migrate"
+        exit 0
+    fi
+    echo ""
+}
+
+#==============================================================================
+# V1.2.1 - LIST ALL SITES ON SERVER
+#==============================================================================
+
+list_all_sites() {
+    local host="${1:-localhost}"
+    
+    print_header "SITES ON THIS SERVER"
+    
+    echo "Scanning /var/www and Apache configurations..."
+    echo ""
+    
+    local total_sites=0
+    local standalone_count=0
+    local multisite_count=0
+    local total_size_bytes=0
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    # Find WordPress installations in /var/www
+    local wp_dirs=()
+    if [[ "$host" == "localhost" ]]; then
+        while IFS= read -r dir; do
+            wp_dirs+=("$dir")
+        done < <(find /var/www -maxdepth 2 -name "wp-config.php" -exec dirname {} \; 2>/dev/null | sort)
+    else
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] && wp_dirs+=("$dir")
+        done < <(remote_exec "$host" "find /var/www -maxdepth 2 -name 'wp-config.php' -exec dirname {} \\; 2>/dev/null | sort")
+    fi
+    
+    if [[ ${#wp_dirs[@]} -eq 0 ]]; then
+        echo "  No WordPress installations found in /var/www"
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        return 0
+    fi
+    
+    for wp_path in "${wp_dirs[@]}"; do
+        # Skip if path is empty
+        [[ -z "$wp_path" ]] && continue
+        
+        ((total_sites++))
+        
+        # Try to get domain from Apache config
+        local domain=""
+        local apache_conf=""
+        if [[ "$host" == "localhost" ]]; then
+            # Find Apache config that points to this DocumentRoot
+            apache_conf=$(grep -rl "DocumentRoot.*$(echo "$wp_path" | sed 's/[.[\*^$()+?{|]/\\&/g')" /etc/apache2/sites-enabled/ 2>/dev/null | head -n 1)
+            if [[ -n "$apache_conf" ]]; then
+                domain=$(grep -i "ServerName" "$apache_conf" 2>/dev/null | head -n 1 | awk '{print $2}')
+            fi
+        else
+            apache_conf=$(remote_exec "$host" "grep -rl 'DocumentRoot.*$wp_path' /etc/apache2/sites-enabled/ 2>/dev/null | head -n 1")
+            if [[ -n "$apache_conf" ]]; then
+                domain=$(remote_exec "$host" "grep -i 'ServerName' $apache_conf 2>/dev/null | head -n 1 | awk '{print \$2}'")
+            fi
+        fi
+        
+        # Fallback: try to get domain from wp-config / wp options
+        if [[ -z "$domain" ]]; then
+            if [[ "$host" == "localhost" ]]; then
+                domain=$(sudo -u www-data wp --path="$wp_path" option get siteurl 2>/dev/null | sed 's|https\?://||' | sed 's|/.*||' || echo "")
+            fi
+        fi
+        
+        # Fallback: derive from directory name
+        if [[ -z "$domain" ]]; then
+            local dir_name=$(basename "$wp_path")
+            domain="[unknown - dir: $dir_name]"
+        fi
+        
+        # Check multisite status
+        local is_ms=false
+        local ms_label="STANDALONE"
+        local ms_icon="🟢"
+        local blog_id=""
+        
+        if [[ "$host" == "localhost" ]]; then
+            if sudo -u www-data wp --path="$wp_path" core is-installed --network 2>/dev/null; then
+                is_ms=true
+                ms_label="MULTISITE"
+                ms_icon="🟡"
+                ((multisite_count++))
+                
+                # Try to get blog_id if domain is known
+                if [[ "$domain" != "[unknown"* ]]; then
+                    blog_id=$(sudo -u www-data wp --path="$wp_path" site list --field=blog_id --url="https://$domain" 2>/dev/null | head -n 1)
+                    if [[ -z "$blog_id" ]]; then
+                        blog_id=$(sudo -u www-data wp --path="$wp_path" site list --field=blog_id --url="http://$domain" 2>/dev/null | head -n 1)
+                    fi
+                fi
+            else
+                ((standalone_count++))
+            fi
+        else
+            if remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" core is-installed --network 2>/dev/null"; then
+                is_ms=true
+                ms_label="MULTISITE"
+                ms_icon="🟡"
+                ((multisite_count++))
+            else
+                ((standalone_count++))
+            fi
+        fi
+        
+        # Get database name from wp-config
+        local db_name=""
+        if [[ "$host" == "localhost" ]]; then
+            db_name=$(grep "define.*'DB_NAME'" "$wp_path/wp-config.php" 2>/dev/null | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+        else
+            db_name=$(remote_exec "$host" "grep \"define.*'DB_NAME'\" $wp_path/wp-config.php 2>/dev/null | sed \"s/.*'\\([^']*\\)'.*/\\1/\" | head -n 1")
+        fi
+        
+        # Get size
+        local site_size=""
+        if [[ "$host" == "localhost" ]]; then
+            site_size=$(du -sh "$wp_path" 2>/dev/null | cut -f1)
+        else
+            site_size=$(remote_exec "$host" "du -sh $wp_path 2>/dev/null | cut -f1")
+        fi
+        
+        # Determine environment
+        local environment="live"
+        if [[ "$wp_path" == *"testing"* ]] || [[ "$domain" == *".testing."* ]] || [[ "$domain" == *"test."* ]]; then
+            environment="test"
+        fi
+        
+        # Display entry
+        echo -e "${ms_icon} ${BOLD}${domain}${NC}$(printf '%*s' $((58 - ${#domain})) '')${CYAN}[${ms_label}]${NC}"
+        echo "   Path:        $wp_path"
+        [[ -n "$db_name" ]] && echo "   Database:    $db_name"
+        [[ "$is_ms" == "true" && -n "$blog_id" ]] && echo "   Blog ID:     $blog_id"
+        [[ -n "$site_size" ]] && echo "   Size:        $site_size"
+        echo "   Environment: $environment"
+        [[ -n "$apache_conf" ]] && echo "   Apache:      $apache_conf"
+        echo ""
+        
+    done
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Summary:"
+    echo "  Total sites:       $total_sites"
+    echo "  Standalone:        $standalone_count (🟢)"
+    echo "  Multisite:         $multisite_count (🟡)"
+    echo ""
+    echo -e "💡 ${CYAN}TIP:${NC} Copy a domain name to use in other operations"
+    if [[ $multisite_count -gt 0 ]]; then
+        echo -e "💡 ${YELLOW}Multisite is LEGACY${NC} - use option 8 to convert subsites to standalone"
+    fi
+    echo ""
+    
+    return 0
+}
+
+#==============================================================================
+# V1.2.1 - QUICK REFERENCE PANEL
+#==============================================================================
+
+show_quick_reference() {
+    cat <<'QREF_EOF'
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                      QUICK REFERENCE GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔍 FINDING SITE INFORMATION:
+
+  List all sites on server:
+    webdev-migrate list-all-sites
+
+  View wp-config.php:
+    sudo cat /var/www/wordpress-SITENAME/wp-config.php
+
+  Get database password:
+    sudo grep DB_PASSWORD /var/www/wordpress-SITENAME/wp-config.php
+
+  Check if multisite:
+    sudo -u www-data wp --path=/path core is-installed --network
+
+  List multisite subsites:
+    sudo -u www-data wp --path=/multisite/path site list
+
+📁 COMMON PATHS:
+
+  WordPress installations:   /var/www/wordpress-*
+  Apache configs:            /etc/apache2/sites-enabled/
+  Backups:                   /srv/backups/wp/
+  Logs:                      /var/log/webdev-migrate/
+
+🔧 TROUBLESHOOTING:
+
+  Restart Apache:
+    sudo systemctl restart apache2
+
+  Check Apache errors:
+    sudo tail -f /var/log/apache2/error.log
+
+  Test database connection:
+    mysql -uUSER -pPASS DATABASE -e "SELECT 1;"
+
+  Clear WordPress cache:
+    sudo -u www-data wp --path=/path cache flush
+
+  Check disk space:
+    df -h /var/www
+
+  Check file permissions:
+    ls -la /var/www/wordpress-SITENAME/
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QREF_EOF
+    
+    read -r -p "Press Enter to return to menu..."
+}
+
+#==============================================================================
+# V1.2.1 - DATABASE PASSWORD HELPER
+#==============================================================================
+
+get_db_password_with_help() {
+    local wp_path="$1"
+    local var_name="${2:-DB_PASS_RESULT}"
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  DATABASE PASSWORD REQUIRED"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  Don't know the database password? Here's how to find it:"
+    echo ""
+    echo "    1. View wp-config.php:"
+    echo "       sudo cat ${wp_path}/wp-config.php | grep DB_PASSWORD"
+    echo ""
+    
+    # Check if we can auto-extract
+    local can_auto=false
+    if [[ -n "$wp_path" && -f "$wp_path/wp-config.php" ]] && is_root; then
+        can_auto=true
+    elif [[ -n "$wp_path" ]] && sudo -n test -f "$wp_path/wp-config.php" 2>/dev/null; then
+        can_auto=true
+    fi
+    
+    if [[ "$can_auto" == "true" ]]; then
+        echo "    2. Or let this tool extract it automatically (requires sudo):"
+        echo "       Press 'a' for auto-extract, or Enter to type manually"
+        echo ""
+        
+        local response
+        read -r -p "  [a/Enter]: " response
+        
+        if [[ "$response" == "a" || "$response" == "A" ]]; then
+            local extracted_pass
+            if is_root; then
+                extracted_pass=$(grep "define.*'DB_PASSWORD'" "$wp_path/wp-config.php" 2>/dev/null | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+            else
+                extracted_pass=$(sudo grep "define.*'DB_PASSWORD'" "$wp_path/wp-config.php" 2>/dev/null | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+            fi
+            
+            if [[ -n "$extracted_pass" ]]; then
+                log_success "  Password extracted from wp-config.php"
+                eval "$var_name=\"\$extracted_pass\""
+                return 0
+            else
+                log_warn "  Could not extract password automatically"
+                echo "  Please type it manually:"
+            fi
+        fi
+    else
+        echo "    2. Auto-extract not available (need sudo access to wp-config.php)"
+        echo ""
+    fi
+    
+    local manual_pass
+    read -r -sp "  Enter database password: " manual_pass
+    echo ""
+    eval "$var_name=\"\$manual_pass\""
+    return 0
+}
+
+#==============================================================================
+# V1.2.1 - STARTUP TIPS
+#==============================================================================
+
+show_startup_tips() {
+    # Only show in interactive TTY mode
+    if [[ ! -t 1 ]] || [[ "$NON_INTERACTIVE" == "true" ]]; then
+        return 0
+    fi
+    
+    echo ""
+    echo -e "${CYAN}💡 TIPS FOR BEGINNERS:${NC}"
+    echo ""
+    echo "  • Open a ${BOLD}SECOND TERMINAL${NC} so you can look up info while using this tool"
+    echo ""
+    echo "  • Most operations require ${BOLD}SUDO${NC} - run: sudo webdev-migrate"
+    echo ""
+    echo "  • Don't know what sites exist? Start with ${BOLD}option S${NC} (List all sites)"
+    echo ""
+    echo "  • Need to look up commands? Use ${BOLD}option R${NC} (Quick Reference)"
+    echo ""
+    echo "  • Press ${BOLD}Ctrl+C${NC} anytime to safely exit"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+}
+
+#==============================================================================
 # MAIN MENU
 #==============================================================================
 
 show_menu() {
     clear
-    cat <<'EOF'
+    cat <<EOF
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
 ║                   WEBDEV MIGRATION TOOL                          ║
-║                     Version 1.0.0                                ║
+║                   Version ${SCRIPT_VERSION}                              ║
 ║                                                                  ║
 ║          Unified WordPress Management for Web Teams              ║
 ║                                                                  ║
@@ -3025,6 +3374,11 @@ EOF
     
     echo "Select an operation:"
     echo ""
+    echo -e "  ${BOLD}── START HERE ──${NC}"
+    echo "  S)  List all sites on this server"
+    echo "  R)  Quick Reference (lookup commands)"
+    echo ""
+    echo -e "  ${BOLD}── OPERATIONS ──${NC}"
     echo "  1)  Inventory a site (show THE 8 FACTS)"
     echo "  2)  Backup a site"
     echo "  3)  Restore a site from backup (with verification)"
@@ -3038,8 +3392,8 @@ EOF
     echo ""
     echo "  0)  Exit"
     echo ""
-    echo "  Note: Multisite is LEGACY - we're phasing it out."
-    echo "        Use option 8 to convert subsites to standalone."
+    echo -e "  💡 ${CYAN}TIP:${NC} Open a second terminal to look things up!"
+    echo -e "  📋 Multisite is ${YELLOW}LEGACY${NC} - use option 8 to convert to standalone."
     echo ""
 }
 
@@ -3048,14 +3402,28 @@ EOF
 #==============================================================================
 
 run_interactive_menu() {
+    # V1.2.1: Show startup tips on first run
+    show_startup_tips
+    
     while true; do
         show_menu
         read -r -p "Choice: " choice
         echo ""
         
         case "$choice" in
+            [sS])
+                # V1.2.1: List all sites
+                list_all_sites
+                ;;
+            [rR])
+                # V1.2.1: Quick Reference
+                show_quick_reference
+                continue  # Skip the "Press Enter" at the end since quick_reference has its own
+                ;;
             1)
                 # Inventory a site
+                echo -e "💡 ${CYAN}Don't know the domain? Use option S to list all sites on this server${NC}"
+                echo ""
                 read -r -p "Enter domain (e.g., portfolios.cs.earlham.edu): " domain
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3063,8 +3431,12 @@ run_interactive_menu() {
                 ;;
             2)
                 # Backup a site
-                read -r -p "Enter WordPress path: " wp_path
+                echo -e "💡 ${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
+                echo -e "💡 ${CYAN}Or use option S to list all sites first${NC}"
+                echo ""
+                read -r -p "Enter WordPress path (e.g., /var/www/wordpress-portfolios): " wp_path
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
+                echo -e "💡 ${CYAN}Environment: 'live' for production, 'test' for testing/staging${NC}"
                 read -r -p "Enter environment (live/test) [live]: " env
                 env=${env:-live}
                 read -r -p "Enter host [localhost]: " host
@@ -3073,7 +3445,10 @@ run_interactive_menu() {
                 ;;
             3)
                 # Restore from backup
+                echo -e "💡 ${CYAN}Backups are stored in: /srv/backups/wp/SITENAME/ENVIRONMENT/TIMESTAMP/${NC}"
+                echo ""
                 read -r -p "Enter backup directory path: " backup_dir
+                echo -e "💡 ${CYAN}This is where WordPress will be restored to${NC}"
                 read -r -p "Enter target WordPress path: " target_wp_path
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3082,12 +3457,17 @@ run_interactive_menu() {
             4)
                 # Migrate site
                 echo "Format: host:slug (e.g., web:portfolios) or just slug for localhost"
+                echo -e "💡 ${CYAN}Example: migrate from old server 'web' to new server 'web-urey'${NC}"
+                echo ""
                 read -r -p "Enter source (e.g., web:portfolios): " source_spec
                 read -r -p "Enter destination (e.g., web-urey:portfolios): " dest_spec
                 migrate_site "$source_spec" "$dest_spec"
                 ;;
             5)
                 # Clone live to test
+                echo -e "💡 ${CYAN}This creates a testing copy of a live site${NC}"
+                echo -e "💡 ${CYAN}The slug is just the first part of the domain (e.g., 'portfolios' from portfolios.cs.earlham.edu)${NC}"
+                echo ""
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3095,6 +3475,9 @@ run_interactive_menu() {
                 ;;
             6)
                 # Promote test to live (V1.2: dry-run first for safety)
+                echo -e "💡 ${CYAN}This replaces the LIVE site with the TEST site content${NC}"
+                echo -e "💡 ${CYAN}A dry-run will be performed first so you can review${NC}"
+                echo ""
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3130,6 +3513,10 @@ run_interactive_menu() {
                 ;;
             7)
                 # List multisite subsites
+                echo -e "💡 ${CYAN}Tip: Multisite installations are LEGACY. Consider standalone instead.${NC}"
+                echo -e "💡 ${CYAN}Not sure if multisite? Run:${NC} sudo -u www-data wp --path=/path core is-installed --network"
+                echo -e "💡 ${CYAN}Don't know the path? Use option S to list all sites first${NC}"
+                echo ""
                 read -r -p "Enter multisite WordPress path: " multisite_path
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3137,7 +3524,11 @@ run_interactive_menu() {
                 ;;
             8)
                 # Promote subsite to standalone (V1.2: dry-run first for safety)
+                echo -e "💡 ${CYAN}This converts a multisite subsite into its own standalone WordPress${NC}"
+                echo -e "💡 ${CYAN}To see all subsites:${NC} sudo -u www-data wp --path=/multisite/path site list"
+                echo ""
                 read -r -p "Enter multisite WordPress path: " multisite_path
+                echo -e "💡 ${CYAN}Blog ID is the numeric ID from the site list above${NC}"
                 read -r -p "Enter blog ID to promote: " blog_id
                 read -r -p "Enter target domain (e.g., newsite.cs.earlham.edu): " target_domain
                 read -r -p "Enter host [localhost]: " host
@@ -3174,6 +3565,8 @@ run_interactive_menu() {
                 ;;
             9)
                 # Health check
+                echo -e "💡 ${CYAN}Don't know the domain? Use option S to list all sites first${NC}"
+                echo ""
                 read -r -p "Enter domain to check: " domain
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3181,9 +3574,13 @@ run_interactive_menu() {
                 ;;
             10)
                 # URL audit
+                echo -e "💡 ${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
+                echo -e "💡 ${CYAN}Or use option S to list all sites first${NC}"
+                echo ""
                 read -r -p "Enter WordPress path: " wp_path
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
+                echo -e "💡 ${CYAN}Deep scan checks plugin metadata (like DFlip PDFs). Use if standard scan doesn't fix issues.${NC}"
                 read -r -p "Run deep scan (plugin metadata)? (y/N): " deep_response
                 local deep_flag="false"
                 if [[ "$deep_response" == "y" || "$deep_response" == "Y" ]]; then
@@ -3197,6 +3594,8 @@ run_interactive_menu() {
                 ;;
             *)
                 log_error "Invalid choice. Please try again."
+                echo ""
+                echo "  Enter a number (0-10), 'S' for site list, or 'R' for quick reference."
                 ;;
         esac
         
@@ -3217,6 +3616,8 @@ USAGE:
     $SCRIPT_NAME [OPTIONS] [COMMAND]
 
 COMMANDS:
+    list-all-sites                  List all WordPress sites on this server (START HERE)
+    quick-reference                 Show lookup commands and common paths
     inventory <domain>              Show detailed site information (THE 8 FACTS)
     backup <wp_path> <slug> [env]   Create backup of a site
     restore <backup_dir> <wp_path>  Restore from backup (with verification)
@@ -3238,10 +3639,14 @@ OPTIONS:
     --log-dir <path>                Set log directory
     --help                          Show this help
 
-EXAMPLES:
-    # Interactive mode (recommended for beginners)
-    $SCRIPT_NAME
+QUICK START FOR BEGINNERS:
+    # See what sites are on this server
+    sudo $SCRIPT_NAME list-all-sites
 
+    # Interactive mode (recommended for beginners)
+    sudo $SCRIPT_NAME
+
+EXAMPLES:
     # Inventory a site (shows THE 8 FACTS)
     $SCRIPT_NAME inventory portfolios.cs.earlham.edu
 
@@ -3269,6 +3674,8 @@ MULTISITE NOTES:
     
     All operations automatically detect multisite context and use correct
     table prefixes (wp_<blogid>_*) and WP-CLI --url flags.
+
+💡 TIP: Most operations require sudo. Run: sudo $SCRIPT_NAME
 
 For full documentation, see README.md
 EOF
@@ -3307,6 +3714,16 @@ parse_arguments() {
                 ;;
             --help|-h)
                 show_help
+                exit 0
+                ;;
+            list-all-sites)
+                shift
+                setup_logging
+                list_all_sites "$@"
+                exit $?
+                ;;
+            quick-reference)
+                show_quick_reference
                 exit 0
                 ;;
             inventory)
@@ -3407,6 +3824,8 @@ main() {
     # Parse command line arguments
     if [[ $# -eq 0 ]]; then
         # No arguments - run interactive mode
+        # V1.2.1: Check sudo availability upfront
+        check_sudo_available
         setup_logging
         check_requirements || exit 1
         run_interactive_menu
