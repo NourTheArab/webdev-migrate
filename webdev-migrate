@@ -8,7 +8,7 @@
 #              V1.2.1: Beginner UX improvements (site discovery, inline help, sudo check)
 #==============================================================================
 
-set -eo pipefail
+   set -o pipefail
 
 #==============================================================================
 # GLOBAL CONFIGURATION
@@ -1621,20 +1621,20 @@ restore_backup() {
     if [[ "$host" == "localhost" ]]; then
         if sudo -u www-data wp --path="$target_wp_path" core version 2>/dev/null; then
             log_success "✓ WordPress core accessible"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_error "✗ WordPress core check failed"
             verification_errors+=("WordPress core not responding")
-            ((checks_failed++))
+            checks_failed=$((checks_failed + 1))
         fi
     else
         if remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" core version 2>/dev/null"; then
             log_success "✓ WordPress core accessible"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_error "✗ WordPress core check failed"
             verification_errors+=("WordPress core not responding")
-            ((checks_failed++))
+            checks_failed=$((checks_failed + 1))
         fi
     fi
     
@@ -1643,18 +1643,18 @@ restore_backup() {
     if [[ "$host" == "localhost" ]]; then
         if sudo -u www-data wp --path="$target_wp_path" db check 2>/dev/null; then
             log_success "✓ Database integrity OK"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_warn "⚠ Database check had warnings (may be OK)"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         fi
     else
         if remote_exec "$host" "sudo -u www-data wp --path=\"$target_wp_path\" db check 2>/dev/null"; then
             log_success "✓ Database integrity OK"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_warn "⚠ Database check had warnings (may be OK)"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         fi
     fi
     
@@ -1673,11 +1673,11 @@ restore_backup() {
         log_success "✓ URL options present"
         echo "  home: $check_home"
         echo "  siteurl: $check_siteurl"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_error "✗ URL options missing"
         verification_errors+=("home or siteurl option not found")
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
     
     # Check 4: Active plugins list
@@ -1690,7 +1690,7 @@ restore_backup() {
     fi
     
     log_success "✓ Plugin check complete ($plugin_count active plugins)"
-    ((checks_passed++))
+    checks_passed=$((checks_passed + 1))
     
     # Check 5: Uploads directory and baseurl
     log_step "Verifying uploads configuration..."
@@ -1704,10 +1704,10 @@ restore_backup() {
     if [[ -n "$uploads_check" ]]; then
         log_success "✓ Uploads configured"
         echo "  baseurl: $uploads_check"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_warn "⚠ Could not verify uploads (may need manual check)"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     fi
     
     # Check 6: External accessibility (if we can determine domain)
@@ -1721,11 +1721,11 @@ restore_backup() {
         
         if [[ "$http_response" =~ ^(200|301|302)$ ]]; then
             log_success "✓ Site accessible externally (HTTP $http_response)"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_warn "⚠ Site not accessible (HTTP $http_response) - may need DNS/Apache config"
             verification_errors+=("Site not accessible via HTTP (got $http_response)")
-            ((checks_failed++))
+            checks_failed=$((checks_failed + 1))
         fi
     fi
     
@@ -2496,10 +2496,10 @@ healthcheck_site() {
     print_section "Check 1: WordPress Files"
     if validate_wp_installation "$wp_path" "$host"; then
         log_success "✓ WordPress files present"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_error "✗ WordPress files incomplete"
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
     
     # Check 2: Database connection
@@ -2510,10 +2510,10 @@ healthcheck_site() {
     
     if test_db_connection "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" "$host"; then
         log_success "✓ Database connection works"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_error "✗ Database connection failed"
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
     
     # Check 3: WordPress URL settings
@@ -2526,13 +2526,13 @@ healthcheck_site() {
         log_success "✓ URLs configured correctly"
         echo "  siteurl: $site_url"
         echo "  home: $home_url"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_warn "⚠ URL mismatch detected"
         echo "  Expected: https://$domain"
         echo "  siteurl: $site_url"
         echo "  home: $home_url"
-        ((checks_warnings++))
+        checks_warnings=$((checks_warnings + 1))
     fi
     
     # Check 4: Apache vhost
@@ -2546,10 +2546,10 @@ healthcheck_site() {
     
     if [[ -n "$vhost_file" ]]; then
         log_success "✓ Apache vhost enabled: $vhost_file"
-        ((checks_passed++))
+        checks_passed=$((checks_passed + 1))
     else
         log_error "✗ Apache vhost not found or not enabled"
-        ((checks_failed++))
+        checks_failed=$((checks_failed + 1))
     fi
     
     # Check 5: Permissions
@@ -2560,20 +2560,20 @@ healthcheck_site() {
         
         if [[ "$wp_owner" == "www-data:www-data" ]]; then
             log_success "✓ WordPress owned by www-data"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_warn "⚠ WordPress ownership: $wp_owner (expected www-data:www-data)"
-            ((checks_warnings++))
+            checks_warnings=$((checks_warnings + 1))
         fi
         
         if [[ -d "$uploads_path" ]]; then
             local uploads_perms=$(stat -c '%a' "$uploads_path")
             if [[ "$uploads_perms" == "755" ]]; then
                 log_success "✓ Uploads directory permissions correct"
-                ((checks_passed++))
+                checks_passed=$((checks_passed + 1))
             else
                 log_warn "⚠ Uploads permissions: $uploads_perms (expected 755)"
-                ((checks_warnings++))
+                checks_warnings=$((checks_warnings + 1))
             fi
         fi
     else
@@ -2586,13 +2586,13 @@ healthcheck_site() {
         local http_code=$(curl -s -o /dev/null -w "%{http_code}" "https://$domain" 2>/dev/null || echo "000")
         if [[ "$http_code" == "200" ]]; then
             log_success "✓ Site accessible (HTTP $http_code)"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         elif [[ "$http_code" == "301" || "$http_code" == "302" ]]; then
             log_success "✓ Site redirects (HTTP $http_code)"
-            ((checks_passed++))
+            checks_passed=$((checks_passed + 1))
         else
             log_error "✗ Site not accessible (HTTP $http_code)"
-            ((checks_failed++))
+            checks_failed=$((checks_failed + 1))
         fi
     else
         log_info "curl not available, skipping accessibility check"
@@ -2606,12 +2606,12 @@ healthcheck_site() {
             local recent_errors=$(grep -i "$domain" "$error_log" | tail -n 10 | grep -i "error" | wc -l)
             if [[ $recent_errors -eq 0 ]]; then
                 log_success "✓ No recent errors in Apache log"
-                ((checks_passed++))
+                checks_passed=$((checks_passed + 1))
             else
                 log_warn "⚠ Found $recent_errors recent errors in Apache log"
                 echo "  Last few errors:"
                 grep -i "$domain" "$error_log" | grep -i "error" | tail -n 3
-                ((checks_warnings++))
+                checks_warnings=$((checks_warnings + 1))
             fi
         fi
     fi
@@ -3087,7 +3087,7 @@ list_all_sites() {
         # Skip if path is empty
         [[ -z "$wp_path" ]] && continue
         
-        ((total_sites++))
+        total_sites=$((total_sites + 1))
         
         # Try to get domain from Apache config
         local domain=""
@@ -3129,7 +3129,7 @@ list_all_sites() {
                 is_ms=true
                 ms_label="MULTISITE"
                 ms_icon="🟡"
-                ((multisite_count++))
+                multisite_count=$((multisite_count + 1))
                 
                 # Try to get blog_id if domain is known
                 if [[ "$domain" != "[unknown"* ]]; then
@@ -3139,16 +3139,16 @@ list_all_sites() {
                     fi
                 fi
             else
-                ((standalone_count++))
+                standalone_count=$((standalone_count + 1))
             fi
         else
             if remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" core is-installed --network 2>/dev/null"; then
                 is_ms=true
                 ms_label="MULTISITE"
                 ms_icon="🟡"
-                ((multisite_count++))
+                multisite_count=$((multisite_count + 1))
             else
-                ((standalone_count++))
+                standalone_count=$((standalone_count + 1))
             fi
         fi
         
@@ -3193,9 +3193,9 @@ list_all_sites() {
     echo "  Standalone:        $standalone_count (🟢)"
     echo "  Multisite:         $multisite_count (🟡)"
     echo ""
-    echo -e "💡 ${CYAN}TIP:${NC} Copy a domain name to use in other operations"
+    echo -e " ${CYAN}TIP:${NC} Copy a domain name to use in other operations"
     if [[ $multisite_count -gt 0 ]]; then
-        echo -e "💡 ${YELLOW}Multisite is LEGACY${NC} - use option 8 to convert subsites to standalone"
+        echo -e " ${YELLOW}Multisite is LEGACY${NC} - use option 8 to convert subsites to standalone"
     fi
     echo ""
     
@@ -3214,7 +3214,7 @@ show_quick_reference() {
                       QUICK REFERENCE GUIDE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🔍 FINDING SITE INFORMATION:
+FINDING SITE INFORMATION:
 
   List all sites on server:
     webdev-migrate list-all-sites
@@ -3231,14 +3231,14 @@ show_quick_reference() {
   List multisite subsites:
     sudo -u www-data wp --path=/multisite/path site list
 
-📁 COMMON PATHS:
+COMMON PATHS:
 
   WordPress installations:   /var/www/wordpress-*
   Apache configs:            /etc/apache2/sites-enabled/
   Backups:                   /srv/backups/wp/
   Logs:                      /var/log/webdev-migrate/
 
-🔧 TROUBLESHOOTING:
+TROUBLESHOOTING:
 
   Restart Apache:
     sudo systemctl restart apache2
@@ -3340,7 +3340,7 @@ show_startup_tips() {
     fi
     
     echo ""
-    echo -e "${CYAN}💡 TIPS FOR BEGINNERS:${NC}"
+    echo -e "${CYAN}TIPS FOR BEGINNERS:${NC}"
     echo ""
     echo "  • Open a ${BOLD}SECOND TERMINAL${NC} so you can look up info while using this tool"
     echo ""
@@ -3365,10 +3365,13 @@ show_menu() {
     cat <<EOF
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
-║                   WEBDEV MIGRATION TOOL                          ║
-║                   Version ${SCRIPT_VERSION}                              ║
+║         ╦ ╦╔═╗       WEBDEV MIGRATION TOOL                       ║
+║         ║║║╠═╝       Version ${SCRIPT_VERSION}                   ║
+║         ╚╩╝╩                                                     ║
+║                   WordPress Teacher & Assistant                  ║
+║                     for Earlham's Webdev Team                    ║
 ║                                                                  ║
-║          Unified WordPress Management for Web Teams              ║
+║                 Made with Coffee by Nour Al-Sheikh               ║
 ║                                                                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 
@@ -3424,7 +3427,7 @@ run_interactive_menu() {
                 ;;
             1)
                 # Inventory a site
-                echo -e "💡 ${CYAN}Don't know the domain? Use option S to list all sites on this server${NC}"
+                echo -e "${CYAN}Don't know the domain? Use option S to list all sites on this server${NC}"
                 echo ""
                 read -r -p "Enter domain (e.g., portfolios.cs.earlham.edu): " domain
                 read -r -p "Enter host [localhost]: " host
@@ -3433,12 +3436,12 @@ run_interactive_menu() {
                 ;;
             2)
                 # Backup a site
-                echo -e "💡 ${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
-                echo -e "💡 ${CYAN}Or use option S to list all sites first${NC}"
+                echo -e "${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
+                echo -e "${CYAN}Or use option S to list all sites first${NC}"
                 echo ""
                 read -r -p "Enter WordPress path (e.g., /var/www/wordpress-portfolios): " wp_path
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
-                echo -e "💡 ${CYAN}Environment: 'live' for production, 'test' for testing/staging${NC}"
+                echo -e "${CYAN}Environment: 'live' for production, 'test' for testing/staging${NC}"
                 read -r -p "Enter environment (live/test) [live]: " env
                 env=${env:-live}
                 read -r -p "Enter host [localhost]: " host
@@ -3447,10 +3450,10 @@ run_interactive_menu() {
                 ;;
             3)
                 # Restore from backup
-                echo -e "💡 ${CYAN}Backups are stored in: /srv/backups/wp/SITENAME/ENVIRONMENT/TIMESTAMP/${NC}"
+                echo -e "${CYAN}Backups are stored in: /srv/backups/wp/SITENAME/ENVIRONMENT/TIMESTAMP/${NC}"
                 echo ""
                 read -r -p "Enter backup directory path: " backup_dir
-                echo -e "💡 ${CYAN}This is where WordPress will be restored to${NC}"
+                echo -e "${CYAN}This is where WordPress will be restored to${NC}"
                 read -r -p "Enter target WordPress path: " target_wp_path
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
@@ -3459,7 +3462,7 @@ run_interactive_menu() {
             4)
                 # Migrate site
                 echo "Format: host:slug (e.g., web:portfolios) or just slug for localhost"
-                echo -e "💡 ${CYAN}Example: migrate from old server 'web' to new server 'web-urey'${NC}"
+                echo -e "${CYAN}Example: migrate from old server 'web' to new server 'web-urey'${NC}"
                 echo ""
                 read -r -p "Enter source (e.g., web:portfolios): " source_spec
                 read -r -p "Enter destination (e.g., web-urey:portfolios): " dest_spec
@@ -3467,8 +3470,8 @@ run_interactive_menu() {
                 ;;
             5)
                 # Clone live to test
-                echo -e "💡 ${CYAN}This creates a testing copy of a live site${NC}"
-                echo -e "💡 ${CYAN}The slug is just the first part of the domain (e.g., 'portfolios' from portfolios.cs.earlham.edu)${NC}"
+                echo -e "${CYAN}This creates a testing copy of a live site${NC}"
+                echo -e "${CYAN}The slug is just the first part of the domain (e.g., 'portfolios' from portfolios.cs.earlham.edu)${NC}"
                 echo ""
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
                 read -r -p "Enter host [localhost]: " host
@@ -3477,8 +3480,8 @@ run_interactive_menu() {
                 ;;
             6)
                 # Promote test to live (V1.2: dry-run first for safety)
-                echo -e "💡 ${CYAN}This replaces the LIVE site with the TEST site content${NC}"
-                echo -e "💡 ${CYAN}A dry-run will be performed first so you can review${NC}"
+                echo -e "${CYAN}This replaces the LIVE site with the TEST site content${NC}"
+                echo -e "${CYAN}A dry-run will be performed first so you can review${NC}"
                 echo ""
                 read -r -p "Enter site slug (e.g., portfolios): " site_slug
                 read -r -p "Enter host [localhost]: " host
@@ -3515,9 +3518,9 @@ run_interactive_menu() {
                 ;;
             7)
                 # List multisite subsites
-                echo -e "💡 ${CYAN}Tip: Multisite installations are LEGACY. Consider standalone instead.${NC}"
-                echo -e "💡 ${CYAN}Not sure if multisite? Run:${NC} sudo -u www-data wp --path=/path core is-installed --network"
-                echo -e "💡 ${CYAN}Don't know the path? Use option S to list all sites first${NC}"
+                echo -e "${CYAN}Tip: Multisite installations are LEGACY. Consider standalone instead.${NC}"
+                echo -e "${CYAN}Not sure if multisite? Run:${NC} sudo -u www-data wp --path=/path core is-installed --network"
+                echo -e "${CYAN}Don't know the path? Use option S to list all sites first${NC}"
                 echo ""
                 read -r -p "Enter multisite WordPress path: " multisite_path
                 read -r -p "Enter host [localhost]: " host
@@ -3526,11 +3529,11 @@ run_interactive_menu() {
                 ;;
             8)
                 # Promote subsite to standalone (V1.2: dry-run first for safety)
-                echo -e "💡 ${CYAN}This converts a multisite subsite into its own standalone WordPress${NC}"
-                echo -e "💡 ${CYAN}To see all subsites:${NC} sudo -u www-data wp --path=/multisite/path site list"
+                echo -e "${CYAN}This converts a multisite subsite into its own standalone WordPress${NC}"
+                echo -e "${CYAN}To see all subsites:${NC} sudo -u www-data wp --path=/multisite/path site list"
                 echo ""
                 read -r -p "Enter multisite WordPress path: " multisite_path
-                echo -e "💡 ${CYAN}Blog ID is the numeric ID from the site list above${NC}"
+                echo -e "${CYAN}Blog ID is the numeric ID from the site list above${NC}"
                 read -r -p "Enter blog ID to promote: " blog_id
                 read -r -p "Enter target domain (e.g., newsite.cs.earlham.edu): " target_domain
                 read -r -p "Enter host [localhost]: " host
@@ -3567,7 +3570,7 @@ run_interactive_menu() {
                 ;;
             9)
                 # Health check
-                echo -e "💡 ${CYAN}Don't know the domain? Use option S to list all sites first${NC}"
+                echo -e "${CYAN}Don't know the domain? Use option S to list all sites first${NC}"
                 echo ""
                 read -r -p "Enter domain to check: " domain
                 read -r -p "Enter host [localhost]: " host
@@ -3576,13 +3579,13 @@ run_interactive_menu() {
                 ;;
             10)
                 # URL audit
-                echo -e "💡 ${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
-                echo -e "💡 ${CYAN}Or use option S to list all sites first${NC}"
+                echo -e "${CYAN}Don't know the path? Look in: /var/www/wordpress-*${NC}"
+                echo -e "${CYAN}Or use option S to list all sites first${NC}"
                 echo ""
                 read -r -p "Enter WordPress path: " wp_path
                 read -r -p "Enter host [localhost]: " host
                 host=${host:-localhost}
-                echo -e "💡 ${CYAN}Deep scan checks plugin metadata (like DFlip PDFs). Use if standard scan doesn't fix issues.${NC}"
+                echo -e "${CYAN}Deep scan checks plugin metadata (like DFlip PDFs). Use if standard scan doesn't fix issues.${NC}"
                 read -r -p "Run deep scan (plugin metadata)? (y/N): " deep_response
                 local deep_flag="false"
                 if [[ "$deep_response" == "y" || "$deep_response" == "Y" ]]; then
@@ -3677,9 +3680,9 @@ MULTISITE NOTES:
     All operations automatically detect multisite context and use correct
     table prefixes (wp_<blogid>_*) and WP-CLI --url flags.
 
-💡 TIP: Most operations require sudo. Run: sudo $SCRIPT_NAME
+TIP: Most operations require sudo. Run: sudo $SCRIPT_NAME
 
-For full documentation, see README.md
+For full documentation, see README.md in GitLab Repo (ask Nour)
 EOF
 }
 
