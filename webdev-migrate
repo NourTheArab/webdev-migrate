@@ -3366,7 +3366,7 @@ show_menu() {
 ╔══════════════════════════════════════════════════════════════════╗
 ║                                                                  ║
 ║         ╦ ╦╔═╗       WEBDEV MIGRATION TOOL                       ║
-║         ║║║╠═╝       Version ${SCRIPT_VERSION}                   ║
+║         ║║║╠═╝       Version ${SCRIPT_VERSION}                               ║
 ║         ╚╩╝╩                                                     ║
 ║                   WordPress Teacher & Assistant                  ║
 ║                     for Earlham's Webdev Team                    ║
