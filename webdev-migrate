@@ -968,7 +968,7 @@ inventory_site() {
     eval "$config_data"
     
     # Test DB connection
-test_db_connection "${db_host:-localhost}" "${db_user}" "${db_pass}" "${db_name}" "$host"
+    test_db_connection "$db_host" "$db_user" "$db_pass" "$db_name" "$host" || {
         log_warn "Database connection test failed, but continuing..."
     }
     
@@ -1771,6 +1771,7 @@ restore_backup() {
     fi
     
     return 0
+}
 }
 
 #==============================================================================
