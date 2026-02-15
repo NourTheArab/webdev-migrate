@@ -83,8 +83,8 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 fi
 
 # V1.4 FIX: SSH ControlMaster — reuse connections to avoid re-authenticating
-# Every remote_exec/remote_copy call goes through the jumphost. Without
-# multiplexing, each call opens a new connection and asks for password.
+# Every remote_exec call goes through the jumphost. Without multiplexing,
+# each call opens a new connection and asks for password.
 # ControlMaster opens one connection per server, then reuses it.
 SSH_CONTROL_DIR=$(mktemp -d /tmp/webdev-migrate-ssh-XXXXXXXX)
 chmod 700 "$SSH_CONTROL_DIR"
@@ -102,7 +102,6 @@ _build_ssh_opts() {
 # Clean up control sockets on exit
 _cleanup_ssh_controls() {
     if [[ -d "${SSH_CONTROL_DIR:-}" ]]; then
-        # Gracefully close all master connections
         for sock in "$SSH_CONTROL_DIR"/*; do
             [[ -S "$sock" ]] && ssh -o ControlPath="$sock" -O exit _ 2>/dev/null || true
         done
@@ -445,6 +444,21 @@ mysqldump_safe() {
     mysqldump --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
 }
 
+# V1.4 FIX: Remote mysql credential helper
+# Process substitution (<()) doesn't work over SSH. Passing -p"password" through
+# SSH double-interprets special chars ($, !, ", backticks).
+# Solution: base64-encode credentials locally, decode on remote into temp file.
+# base64 output is [A-Za-z0-9+/=] only — safe through any shell layer.
+_remote_mysql_cnf() {
+    # Returns a shell command string that creates a temp credentials file on remote
+    # Usage: local setup=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
+    #        remote_exec "$host" "$setup && mysql --defaults-extra-file=\$_MYSQL_CNF dbname ...; rm -f \$_MYSQL_CNF"
+    local db_host="$1" db_user="$2" db_pass="$3"
+    local _creds_b64
+    _creds_b64=$(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$db_user" "$db_pass" "$db_host" | base64 -w0)
+    echo "_MYSQL_CNF=\$(mktemp /tmp/.webdev-mycnf-XXXXXXXX) && echo '${_creds_b64}' | base64 -d > \$_MYSQL_CNF && chmod 600 \$_MYSQL_CNF"
+}
+
 #==============================================================================
 # ENVIRONMENT VALIDATION (V1.2 - Prevents live/test confusion)
 #==============================================================================
@@ -767,8 +781,10 @@ test_db_connection() {
             return 0
         fi
     else
-        # Remote: password travels over encrypted SSH, process list exposure is on remote only
-        local test_cmd="mysql -h \"$db_host\" -u \"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
+        # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
+        local _cnf_test
+        _cnf_test=$(_remote_mysql_cnf "$db_host" "$db_user" "$db_pass")
+        local test_cmd="$_cnf_test && mysql --defaults-extra-file=\$_MYSQL_CNF '$db_name' -e 'SELECT 1;' >/dev/null 2>&1; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc"
         if remote_exec "$host" "$test_cmd"; then
             log_success "Database connection successful"
             return 0
@@ -1213,8 +1229,7 @@ test_server_connection() {
         checks_passed=$((checks_passed + 1))
         
         # V1.4: Establish persistent ControlMaster (without BatchMode) for reuse
-        # The test above used BatchMode=yes which won't create a persistent master.
-        # Open a background master so subsequent remote_exec calls don't re-auth.
+        # BatchMode=yes prevents creating a persistent master, so open one now
         local master_opts="$(_build_ssh_opts)"
         if [[ -n "$proxy" ]]; then
             if [[ "$proxy" == *"@"* ]]; then
@@ -1317,7 +1332,6 @@ remote_exec() {
     local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
     
     if [[ -n "$ip" ]]; then
-        # Use session-based connection
         # V1.4: Use shared SSH options (ControlMaster reuses connection, sudo key)
         local ssh_opts="$(_build_ssh_opts)"
         if [[ -n "$proxy" ]]; then
@@ -1710,7 +1724,10 @@ create_backup() {
             "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';" 2>/dev/null || echo "0")
     else
         est_files_mb=$(remote_exec "$host" "du -sm $wp_path 2>/dev/null | cut -f1" 2>/dev/null || echo "0")
-        est_db_mb=$(remote_exec "$host" "mysql -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$DB_NAME\" -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"" 2>/dev/null || echo "0")
+        # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues
+        local _cnf_est
+        _cnf_est=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
+        est_db_mb=$(remote_exec "$host" "$_cnf_est && mysql --defaults-extra-file=\$_MYSQL_CNF '$DB_NAME' -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"; rm -f \$_MYSQL_CNF" 2>/dev/null || echo "0")
     fi
     est_files_mb="${est_files_mb:-0}"
     est_db_mb="${est_db_mb:-0}"
@@ -1733,7 +1750,10 @@ create_backup() {
     if [[ "$host" == "localhost" ]]; then
         mkdir -p "$backup_dir"
     else
-        remote_exec "$host" "mkdir -p $backup_dir"
+        remote_exec "$host" "sudo mkdir -p $backup_dir"
+        # V1.4 FIX: Chown to SSH user so tar/cp/redirects work without sudo on every command
+        local _remote_user="${SERVER_CONFIG[${host}.user]:-$(whoami)}"
+        remote_exec "$host" "sudo chown -R $_remote_user $backup_dir"
     fi
     
     # Backup database
@@ -1751,7 +1771,10 @@ create_backup() {
                 return 1
             }
         else
-            local dump_cmd="mysqldump -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" --single-transaction --routines --triggers \"$DB_NAME\" | gzip > \"$db_dump\""
+            # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
+            local _cnf_dump
+            _cnf_dump=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
+            local dump_cmd="$_cnf_dump && mysqldump --defaults-extra-file=\$_MYSQL_CNF --single-transaction --routines --triggers '$DB_NAME' | gzip > '$db_dump'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc"
             remote_exec "$host" "$dump_cmd" || {
                 log_error "Database backup failed"
                 return 1
@@ -1793,7 +1816,7 @@ create_backup() {
             fi
         else
             if remote_exec "$host" "test -d $uploads_path"; then
-                remote_exec "$host" "tar -czf $uploads_archive -C $wp_path/wp-content uploads/" || log_warn "Uploads backup had warnings"
+                remote_exec "$host" "sudo tar -czf $uploads_archive -C $wp_path/wp-content uploads/" || log_warn "Uploads backup had warnings"
                 log_success "Uploads backed up"
             else
                 log_warn "Uploads directory not found, skipping"
@@ -1809,7 +1832,7 @@ create_backup() {
         if [[ "$host" == "localhost" ]]; then
             cp "$wp_path/wp-config.php" "$backup_dir/" || log_warn "Could not copy wp-config.php"
         else
-            remote_exec "$host" "cp $wp_path/wp-config.php $backup_dir/" || log_warn "Could not copy wp-config.php"
+            remote_exec "$host" "sudo cp $wp_path/wp-config.php $backup_dir/" || log_warn "Could not copy wp-config.php"
         fi
     fi
     
@@ -2045,7 +2068,10 @@ restore_backup() {
     if [[ "$host" == "localhost" ]]; then
         mkdir -p "$target_wp_path"
     else
-        remote_exec "$host" "mkdir -p $target_wp_path"
+        remote_exec "$host" "sudo mkdir -p $target_wp_path"
+        # V1.4 FIX: Chown to SSH user so tar/file operations can write
+        local _rest_user="${SERVER_CONFIG[${host}.user]:-$(whoami)}"
+        remote_exec "$host" "sudo chown -R $_rest_user $target_wp_path"
     fi
     
     # Restore uploads
@@ -2112,8 +2138,11 @@ restore_backup() {
         sudo mysql -e "FLUSH PRIVILEGES;" || true
     else
         remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $target_db_name;'" || log_warn "Database might already exist"
-        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';\"" || true
-        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'" || true
+        # V1.4 FIX: Base64-encode full SQL to avoid password escaping issues through SSH
+        local _grant_sql="GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}'; FLUSH PRIVILEGES;"
+        local _grant_b64
+        _grant_b64=$(echo -n "$_grant_sql" | base64 -w0)
+        remote_exec "$host" "echo '${_grant_b64}' | base64 -d | sudo mysql" || true
     fi
     
     # Import database
@@ -2124,7 +2153,10 @@ restore_backup() {
             return 1
         }
     else
-        remote_exec "$host" "gunzip -c $db_dump | mysql -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$target_db_name\"" || {
+        # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
+        local _cnf_imp
+        _cnf_imp=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
+        remote_exec "$host" "$_cnf_imp && gunzip -c '$db_dump' | mysql --defaults-extra-file=\$_MYSQL_CNF '$target_db_name'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
             log_error "Database import failed"
             return 1
         }
@@ -2391,7 +2423,10 @@ migrate_site() {
             if [[ "$dst_host" == "localhost" ]]; then
                 mkdir -p "$dst_backup_dir"
             else
-                remote_exec "$dst_host" "mkdir -p $dst_backup_dir"
+                remote_exec "$dst_host" "sudo mkdir -p $dst_backup_dir"
+                # V1.4 FIX: Chown to SSH user so rsync can write files
+                local _dh_user="${SERVER_CONFIG[${dst_host}.user]:-$(whoami)}"
+                remote_exec "$dst_host" "sudo chown -R $_dh_user $dst_backup_dir"
             fi
             
             # Transfer files
@@ -2544,8 +2579,11 @@ clone_live_to_test() {
         sudo mysql -e "FLUSH PRIVILEGES;"
     else
         remote_exec "$host" "sudo mysqldump $live_db | sudo mysql $test_db"
-        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${test_db}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';\""
-        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'"
+        # V1.4 FIX: Base64-encode full SQL to avoid password escaping issues through SSH
+        local _grant_sql2="GRANT ALL PRIVILEGES ON ${test_db}.* TO '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}'; FLUSH PRIVILEGES;"
+        local _grant_b64_2
+        _grant_b64_2=$(echo -n "$_grant_sql2" | base64 -w0)
+        remote_exec "$host" "echo '${_grant_b64_2}' | base64 -d | sudo mysql"
     fi
     log_success "Database copied"
     
@@ -2692,7 +2730,10 @@ promote_test_to_live() {
             return 1
         }
     else
-        remote_exec "$host" "mysqldump -h \"${DB_HOST:-localhost}\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$test_db\" > $temp_dump" || {
+        # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
+        local _cnf_tdump
+        _cnf_tdump=$(_remote_mysql_cnf "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS")
+        remote_exec "$host" "$_cnf_tdump && mysqldump --defaults-extra-file=\$_MYSQL_CNF '$test_db' > '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
             log_error "Failed to dump test database"
             return 1
         }
@@ -2707,7 +2748,10 @@ promote_test_to_live() {
         }
         rm "$temp_dump"
     else
-        remote_exec "$host" "mysql -h \"$live_db_host\" -u \"$live_db_user\" -p\"$live_db_pass\" \"$live_db\" < $temp_dump && rm $temp_dump" || {
+        # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
+        local _cnf_limp
+        _cnf_limp=$(_remote_mysql_cnf "$live_db_host" "$live_db_user" "$live_db_pass")
+        remote_exec "$host" "$_cnf_limp && mysql --defaults-extra-file=\$_MYSQL_CNF '$live_db' < '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF '$temp_dump'; exit \$_rc" || {
             log_error "Failed to import to live database"
             return 1
         }
@@ -2867,7 +2911,7 @@ promote_subsite_to_standalone() {
         # Copy WordPress core from multisite
         rsync -av --exclude='wp-content/uploads' "$multisite_path/" "$target_wp_path/"
     else
-        remote_exec "$host" "mkdir -p $target_wp_path"
+        remote_exec "$host" "sudo mkdir -p $target_wp_path"
         remote_exec "$host" "rsync -av --exclude='wp-content/uploads' $multisite_path/ $target_wp_path/"
     fi
     
@@ -2879,8 +2923,11 @@ promote_subsite_to_standalone() {
         sudo mysql -e "FLUSH PRIVILEGES;"
     else
         remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $target_db;'"
-        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db}.* TO '$ms_db_user'@'localhost' IDENTIFIED BY '$ms_db_pass';\""
-        remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'"
+        # V1.4 FIX: Base64-encode full SQL to avoid password escaping issues through SSH
+        local _grant_sql3="GRANT ALL PRIVILEGES ON ${target_db}.* TO '${ms_db_user}'@'localhost' IDENTIFIED BY '${ms_db_pass}'; FLUSH PRIVILEGES;"
+        local _grant_b64_3
+        _grant_b64_3=$(echo -n "$_grant_sql3" | base64 -w0)
+        remote_exec "$host" "echo '${_grant_b64_3}' | base64 -d | sudo mysql"
     fi
     
     # Step 4: Export and import subsite tables
@@ -2938,7 +2985,7 @@ promote_subsite_to_standalone() {
         fi
     else
         if remote_exec "$host" "test -d $ms_uploads"; then
-            remote_exec "$host" "mkdir -p $target_uploads"
+            remote_exec "$host" "sudo mkdir -p $target_uploads"
             remote_exec "$host" "rsync -av $ms_uploads/ $target_uploads/"
             log_success "Uploads copied"
         else
@@ -4237,7 +4284,10 @@ migrate_wizard_multi() {
     log_step "[2/5] Transferring backup: $src_server → $dst_server..."
     local dst_backup_dir="/srv/backups/wp/$site_slug/migration-dest/$RUN_TIMESTAMP"
     
-    remote_exec "$dst_server" "mkdir -p $dst_backup_dir" 2>/dev/null
+    remote_exec "$dst_server" "sudo mkdir -p $dst_backup_dir" 2>/dev/null
+    # V1.4 FIX: Chown to SSH user so rsync can write files
+    local _dst_user="${SERVER_CONFIG[${dst_server}.user]:-$(whoami)}"
+    remote_exec "$dst_server" "sudo chown -R $_dst_user $dst_backup_dir" 2>/dev/null
     
     # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
     local temp_dir
