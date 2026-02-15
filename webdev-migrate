@@ -59,9 +59,9 @@ GLOBAL_LOCK_FD=""
 GLOBAL_LOCK_FILE=""
 
 # Multi-server session management (V1.3)
-declare -A SERVER_CONFIG      # Stores server configurations
-declare -A SERVER_STATUS      # Connection status for each server
-declare -a ACTIVE_SERVERS     # Array of active server names in session
+declare -A SERVER_CONFIG=()   # Stores server configurations
+declare -A SERVER_STATUS=()   # Connection status for each server
+declare -a ACTIVE_SERVERS=()  # Array of active server names in session
 CURRENT_SCOPE="local"         # "local" or "multi"
 
 # Server profiles directory (V1.3)
