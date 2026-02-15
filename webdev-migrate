@@ -785,10 +785,8 @@ test_db_connection() {
             return 0
         fi
     else
-        # V1.4.1 FIX: Use explicit credentials (defaults-extra-file doesn't work with socket auth)
-        local _esc_pass
-        _esc_pass=$(printf '%q' "$db_pass")
-        local test_cmd="sudo mysql -h '$db_host' -u '$db_user' -p$_esc_pass '$db_name' -e 'SELECT 1;' >/dev/null 2>&1"
+        # V1.4.1 FIX: Use single quotes around password for SSH transmission
+        local test_cmd="sudo mysql -h '$db_host' -u '$db_user' -p'$db_pass' '$db_name' -e 'SELECT 1;' >/dev/null 2>&1"
         if remote_exec "$host" "$test_cmd"; then
             log_success "Database connection successful"
             return 0
@@ -1728,10 +1726,8 @@ create_backup() {
             "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';" 2>/dev/null || echo "0")
     else
         est_files_mb=$(remote_exec "$host" "du -sm $wp_path 2>/dev/null | cut -f1" 2>/dev/null || echo "0")
-        # V1.4.1 FIX: Use explicit credentials (defaults-extra-file doesn't work with socket auth)
-        local _esc_pass
-        _esc_pass=$(printf '%q' "$DB_PASS")
-        est_db_mb=$(remote_exec "$host" "sudo mysql -h '$DB_HOST' -u '$DB_USER' -p$_esc_pass '$DB_NAME' -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"" 2>/dev/null || echo "0")
+        # V1.4.1 FIX: Use single quotes around password for SSH transmission
+        est_db_mb=$(remote_exec "$host" "sudo mysql -h '$DB_HOST' -u '$DB_USER' -p'$DB_PASS' '$DB_NAME' -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"" 2>/dev/null || echo "0")
     fi
     est_files_mb="${est_files_mb:-0}"
     est_db_mb="${est_db_mb:-0}"
@@ -1775,11 +1771,9 @@ create_backup() {
                 return 1
             }
         else
-            # V1.4.1 FIX: Remote server also uses socket auth, needs sudo + explicit credentials
-            # Escape password for SSH transmission using printf %q (bash quote escaping)
-            local _esc_pass
-            _esc_pass=$(printf '%q' "$DB_PASS")
-            local dump_cmd="sudo mysqldump -h '$DB_HOST' -u '$DB_USER' -p$_esc_pass --single-transaction --routines --triggers '$DB_NAME' | gzip > '$db_dump'"
+            # V1.4.1 FIX: Remote server needs sudo + properly quoted password for SSH
+            # Use single quotes around password to protect special chars during SSH transmission
+            local dump_cmd="sudo mysqldump -h '$DB_HOST' -u '$DB_USER' -p'$DB_PASS' --single-transaction --routines --triggers '$DB_NAME' | gzip > '$db_dump'"
             remote_exec "$host" "$dump_cmd" || {
                 log_error "Database backup failed"
                 return 1
@@ -2159,10 +2153,8 @@ restore_backup() {
             return 1
         }
     else
-        # V1.4.1 FIX: Use explicit credentials (defaults-extra-file doesn't work with socket auth)
-        local _esc_pass
-        _esc_pass=$(printf '%q' "$DB_PASS")
-        remote_exec "$host" "gunzip -c '$db_dump' | sudo mysql -h '$DB_HOST' -u '$DB_USER' -p$_esc_pass '$target_db_name'" || {
+        # V1.4.1 FIX: Use single quotes around password for SSH transmission
+        remote_exec "$host" "gunzip -c '$db_dump' | sudo mysql -h '$DB_HOST' -u '$DB_USER' -p'$DB_PASS' '$target_db_name'" || {
             log_error "Database import failed"
             return 1
         }
@@ -2736,10 +2728,8 @@ promote_test_to_live() {
             return 1
         }
     else
-        # V1.4.1 FIX: Use explicit credentials (defaults-extra-file doesn't work with socket auth)
-        local _esc_pass
-        _esc_pass=$(printf '%q' "$DB_PASS")
-        remote_exec "$host" "sudo mysqldump -h '${DB_HOST:-localhost}' -u '$DB_USER' -p$_esc_pass '$test_db' > '$temp_dump'" || {
+        # V1.4.1 FIX: Use single quotes around password for SSH transmission
+        remote_exec "$host" "sudo mysqldump -h '${DB_HOST:-localhost}' -u '$DB_USER' -p'$DB_PASS' '$test_db' > '$temp_dump'" || {
             log_error "Failed to dump test database"
             return 1
         }
@@ -2754,10 +2744,8 @@ promote_test_to_live() {
         }
         rm "$temp_dump"
     else
-        # V1.4.1 FIX: Use explicit credentials (defaults-extra-file doesn't work with socket auth)
-        local _esc_live_pass
-        _esc_live_pass=$(printf '%q' "$live_db_pass")
-        remote_exec "$host" "sudo mysql -h '$live_db_host' -u '$live_db_user' -p$_esc_live_pass '$live_db' < '$temp_dump'; rm -f '$temp_dump'" || {
+        # V1.4.1 FIX: Use single quotes around password for SSH transmission
+        remote_exec "$host" "sudo mysql -h '$live_db_host' -u '$live_db_user' -p'$live_db_pass' '$live_db' < '$temp_dump'; rm -f '$temp_dump'" || {
             log_error "Failed to import to live database"
             return 1
         }
