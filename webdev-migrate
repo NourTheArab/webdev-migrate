@@ -435,13 +435,13 @@ _safe_load_config() {
 mysql_safe() {
     local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
     shift 3
-    mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+    sudo mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
 }
 
 mysqldump_safe() {
     local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
     shift 3
-    mysqldump --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+    sudo mysqldump --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
 }
 
 # V1.4 FIX: Remote mysql credential helper
@@ -784,7 +784,7 @@ test_db_connection() {
         # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
         local _cnf_test
         _cnf_test=$(_remote_mysql_cnf "$db_host" "$db_user" "$db_pass")
-        local test_cmd="$_cnf_test && mysql --defaults-extra-file=\$_MYSQL_CNF '$db_name' -e 'SELECT 1;' >/dev/null 2>&1; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc"
+        local test_cmd="$_cnf_test && sudo mysql --defaults-extra-file=\$_MYSQL_CNF '$db_name' -e 'SELECT 1;' >/dev/null 2>&1; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc"
         if remote_exec "$host" "$test_cmd"; then
             log_success "Database connection successful"
             return 0
@@ -1727,7 +1727,7 @@ create_backup() {
         # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues
         local _cnf_est
         _cnf_est=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
-        est_db_mb=$(remote_exec "$host" "$_cnf_est && mysql --defaults-extra-file=\$_MYSQL_CNF '$DB_NAME' -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"; rm -f \$_MYSQL_CNF" 2>/dev/null || echo "0")
+        est_db_mb=$(remote_exec "$host" "$_cnf_est && sudo mysql --defaults-extra-file=\$_MYSQL_CNF '$DB_NAME' -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"; rm -f \$_MYSQL_CNF" 2>/dev/null || echo "0")
     fi
     est_files_mb="${est_files_mb:-0}"
     est_db_mb="${est_db_mb:-0}"
@@ -1910,7 +1910,7 @@ fi
 
 echo ""
 echo "Restoring database..."
-gunzip -c "$BACKUP_DIR/db.sql.gz" | mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\n' "$DB_USER" "$DB_PASS") "$DB_NAME"
+gunzip -c "$BACKUP_DIR/db.sql.gz" | sudo mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\n' "$DB_USER" "$DB_PASS") "$DB_NAME"
 
 echo "Restoring uploads..."
 mkdir -p "$WP_PATH/wp-content"
@@ -2156,7 +2156,7 @@ restore_backup() {
         # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
         local _cnf_imp
         _cnf_imp=$(_remote_mysql_cnf "$DB_HOST" "$DB_USER" "$DB_PASS")
-        remote_exec "$host" "$_cnf_imp && gunzip -c '$db_dump' | mysql --defaults-extra-file=\$_MYSQL_CNF '$target_db_name'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
+        remote_exec "$host" "$_cnf_imp && gunzip -c '$db_dump' | sudo mysql --defaults-extra-file=\$_MYSQL_CNF '$target_db_name'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
             log_error "Database import failed"
             return 1
         }
@@ -2733,7 +2733,7 @@ promote_test_to_live() {
         # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
         local _cnf_tdump
         _cnf_tdump=$(_remote_mysql_cnf "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS")
-        remote_exec "$host" "$_cnf_tdump && mysqldump --defaults-extra-file=\$_MYSQL_CNF '$test_db' > '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
+        remote_exec "$host" "$_cnf_tdump && sudo mysqldump --defaults-extra-file=\$_MYSQL_CNF '$test_db' > '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF; exit \$_rc" || {
             log_error "Failed to dump test database"
             return 1
         }
@@ -2751,7 +2751,7 @@ promote_test_to_live() {
         # V1.4 FIX: Use base64-encoded credentials to avoid shell escaping issues over SSH
         local _cnf_limp
         _cnf_limp=$(_remote_mysql_cnf "$live_db_host" "$live_db_user" "$live_db_pass")
-        remote_exec "$host" "$_cnf_limp && mysql --defaults-extra-file=\$_MYSQL_CNF '$live_db' < '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF '$temp_dump'; exit \$_rc" || {
+        remote_exec "$host" "$_cnf_limp && sudo mysql --defaults-extra-file=\$_MYSQL_CNF '$live_db' < '$temp_dump'; _rc=\$?; rm -f \$_MYSQL_CNF '$temp_dump'; exit \$_rc" || {
             log_error "Failed to import to live database"
             return 1
         }
