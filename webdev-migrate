@@ -741,12 +741,12 @@ parse_wp_config() {
         config_content=$(remote_exec "$host" "cat $wp_config")
     fi
     
-    # Extract DB credentials
-    local db_name=$(echo "$config_content" | grep "define.*'DB_NAME'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
-    local db_user=$(echo "$config_content" | grep "define.*'DB_USER'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
-    local db_pass=$(echo "$config_content" | grep "define.*'DB_PASSWORD'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
-    local db_host=$(echo "$config_content" | grep "define.*'DB_HOST'" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
-    local table_prefix=$(echo "$config_content" | grep "table_prefix" | sed "s/.*=.*'\([^']*\)'.*/\1/" | head -n 1)
+    # Extract DB credentials (V1.4.1: Skip commented lines like /**define(...)**/  or // define(...))
+    local db_name=$(echo "$config_content" | grep "define.*'DB_NAME'" | grep -v "^\s*/\*" | grep -v "^\s*//" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_user=$(echo "$config_content" | grep "define.*'DB_USER'" | grep -v "^\s*/\*" | grep -v "^\s*//" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_pass=$(echo "$config_content" | grep "define.*'DB_PASSWORD'" | grep -v "^\s*/\*" | grep -v "^\s*//" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local db_host=$(echo "$config_content" | grep "define.*'DB_HOST'" | grep -v "^\s*/\*" | grep -v "^\s*//" | sed "s/.*'\([^']*\)'.*/\1/" | head -n 1)
+    local table_prefix=$(echo "$config_content" | grep "table_prefix" | grep -v "^\s*/\*" | grep -v "^\s*//" | sed "s/.*=.*'\([^']*\)'.*/\1/" | head -n 1)
     
     # Default values
     db_host="${db_host:-localhost}"
