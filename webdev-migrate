@@ -2,7 +2,7 @@
 
 #==============================================================================
 # webdev-migrate: Unified WordPress Migration & Management Tool
-# Version: 1.3.0
+# Version: 1.4.0
 # Description: Complete WordPress site management for university web teams
 #              Handles backup, restore, migration, cloning, and multisite conversions
 #             Made for Earlham College Web Dev team
@@ -10,12 +10,13 @@
 #==============================================================================
 
    set -o pipefail
+   set -u  # V1.4 SECURITY: Fail on unset variables to catch bugs early
 
 #==============================================================================
 # GLOBAL CONFIGURATION
 #==============================================================================
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_TIME=$(date +%s)
@@ -352,6 +353,49 @@ sanitize_slug() {
     echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
 }
 
+# V1.4 SECURITY: Safe config loader — replaces dangerous eval "$config_data"
+# parse_wp_config() outputs KEY=VALUE lines. eval'ing those is an injection risk
+# if a wp-config.php password contains $(cmd) or backticks. This function
+# safely extracts only the known keys without executing any shell code.
+_safe_load_config() {
+    local config_output="$1"
+    # Reset all config variables to empty
+    DB_NAME="" DB_USER="" DB_PASS="" DB_HOST="" TABLE_PREFIX="" IS_MULTISITE=""
+    while IFS= read -r line; do
+        # Split on first '=' only (passwords can contain '=')
+        local key="${line%%=*}"
+        local value="${line#*=}"
+        case "$key" in
+            DB_NAME)       DB_NAME="$value" ;;
+            DB_USER)       DB_USER="$value" ;;
+            DB_PASS)       DB_PASS="$value" ;;
+            DB_HOST)       DB_HOST="$value" ;;
+            TABLE_PREFIX)  TABLE_PREFIX="$value" ;;
+            IS_MULTISITE)  IS_MULTISITE="$value" ;;
+        esac
+    done <<< "$config_output"
+}
+
+# V1.4 SECURITY: Safe MySQL wrappers — hide passwords from process list
+# Instead of: mysql -u"$user" -p"$pass" "$db"
+# Use:        mysql_safe "$host" "$user" "$pass" "$db" [-N -e "query"]
+# The password is passed via process substitution (never appears in `ps aux`)
+# NOTE: These only work for LOCAL execution. For remote (SSH) commands,
+# passwords are sent over encrypted SSH and exposure is limited to the
+# remote server's process list. A future improvement could deploy temp
+# credential files on remotes.
+mysql_safe() {
+    local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
+    shift 3
+    mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+}
+
+mysqldump_safe() {
+    local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
+    shift 3
+    mysqldump --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+}
+
 #==============================================================================
 # ENVIRONMENT VALIDATION (V1.2 - Prevents live/test confusion)
 #==============================================================================
@@ -667,14 +711,15 @@ test_db_connection() {
     
     log_step "Testing database connection"
     
-    local test_cmd="mysql -h \"$db_host\" -u \"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
-    
     if [[ "$host" == "localhost" ]]; then
-        if eval "$test_cmd"; then
+        # V1.4 SECURITY: Use mysql_safe to hide password from process list
+        if mysql_safe "$db_host" "$db_user" "$db_pass" "$db_name" -e 'SELECT 1;' >/dev/null 2>&1; then
             log_success "Database connection successful"
             return 0
         fi
     else
+        # Remote: password travels over encrypted SSH, process list exposure is on remote only
+        local test_cmd="mysql -h \"$db_host\" -u \"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
         if remote_exec "$host" "$test_cmd"; then
             log_success "Database connection successful"
             return 0
@@ -840,9 +885,9 @@ get_blog_id_for_domain() {
         if [[ -z "$blog_id" ]]; then
             local config_data
             config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
-            eval "$config_data"
+            _safe_load_config "$config_data"
             
-            blog_id=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "SELECT blog_id FROM ${TABLE_PREFIX}blogs WHERE domain='$domain' LIMIT 1" 2>/dev/null)
+            blog_id=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "SELECT blog_id FROM ${TABLE_PREFIX}blogs WHERE domain='$domain' LIMIT 1" 2>/dev/null)
         fi
     else
         blog_id=$(remote_exec "$host" "sudo -u www-data wp --path=\"$wp_path\" site list --field=blog_id --url=\"https://$domain\" 2>/dev/null | head -n 1")
@@ -894,7 +939,7 @@ get_table_prefix_for_blog() {
     # Parse base prefix from wp-config
     local config_data
     config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
-    eval "$config_data"
+    _safe_load_config "$config_data"
     local base_prefix="$TABLE_PREFIX"
     
     if ! is_multisite "$wp_path" "$host"; then
@@ -970,6 +1015,7 @@ save_server_profile() {
     local user="$3"
     local proxy="${4:-}"
     local description="${5:-}"
+    local proxy_user="${6:-$user}"  # V1.4 FIX: Separate proxy user, defaults to SSH user
     
     local profile_file="${PROFILE_DIR}/${name}.conf"
     
@@ -982,7 +1028,7 @@ SERVER_NAME="$name"
 SERVER_IP="$ip"
 SERVER_USER="$user"
 SERVER_PROXY="$proxy"
-SERVER_PROXY_USER="$user"
+SERVER_PROXY_USER="$proxy_user"
 SERVER_DESCRIPTION="$description"
 
 SSH_KEY_PATH="\${HOME}/.ssh/id_rsa"
@@ -1071,8 +1117,8 @@ test_server_connection() {
         return 0
     fi
     
-    local ip="${SERVER_CONFIG[${server_name}.ip]}"
-    local user="${SERVER_CONFIG[${server_name}.user]}"
+    local ip="${SERVER_CONFIG[${server_name}.ip]:-}"
+    local user="${SERVER_CONFIG[${server_name}.user]:-}"
     local proxy="${SERVER_CONFIG[${server_name}.proxy]:-}"
     
     if [[ -z "$ip" ]]; then
@@ -1100,9 +1146,17 @@ test_server_connection() {
     log_step "Testing SSH connection..."
     local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
     
+    # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
+    local proxy_user="${SERVER_CONFIG[${server_name}.proxy_user]:-${user}}"
     if [[ -n "$proxy" ]]; then
-        ssh_opts="$ssh_opts -J ${proxy}"
-        log_info "  Using ProxyJump: $proxy"
+        # If proxy already contains '@', use as-is; otherwise prepend proxy_user
+        if [[ "$proxy" == *"@"* ]]; then
+            ssh_opts="$ssh_opts -J ${proxy}"
+            log_info "  Using ProxyJump: $proxy"
+        else
+            ssh_opts="$ssh_opts -J ${proxy_user}@${proxy}"
+            log_info "  Using ProxyJump: ${proxy_user}@${proxy}"
+        fi
     fi
     
     if ssh $ssh_opts "${user}@${ip}" "echo connected" >/dev/null 2>&1; then
@@ -1113,7 +1167,7 @@ test_server_connection() {
         echo ""
         echo "  Troubleshooting:"
         echo "    1. Copy SSH key: ssh-copy-id ${user}@${ip}"
-        [[ -n "$proxy" ]] && echo "       Or: ssh-copy-id -o ProxyJump=${proxy} ${user}@${ip}"
+        [[ -n "$proxy" ]] && echo "       Or: ssh-copy-id -o ProxyJump=${proxy_user}@${proxy} ${user}@${ip}"
         echo "    2. Test manually: ssh ${ssh_opts} ${user}@${ip}"
         echo ""
         checks_failed=$((checks_failed + 1))
@@ -1203,7 +1257,15 @@ remote_exec() {
     if [[ -n "$ip" ]]; then
         # Use session-based connection
         local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=30"
-        [[ -n "$proxy" ]] && ssh_opts="$ssh_opts -J ${proxy}"
+        # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
+        if [[ -n "$proxy" ]]; then
+            local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
+            if [[ "$proxy" == *"@"* ]]; then
+                ssh_opts="$ssh_opts -J ${proxy}"
+            else
+                ssh_opts="$ssh_opts -J ${proxy_user}@${proxy}"
+            fi
+        fi
         
         log_debug "Executing on $server ($ip): $command"
         ssh $ssh_opts "${user}@${ip}" "$command"
@@ -1232,8 +1294,14 @@ remote_copy() {
     local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
     
     local rsync_ssh_opts=""
+    # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
     if [[ -n "$proxy" ]]; then
-        rsync_ssh_opts="-e 'ssh -J ${proxy}'"
+        local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
+        if [[ "$proxy" == *"@"* ]]; then
+            rsync_ssh_opts="-e 'ssh -J ${proxy}'"
+        else
+            rsync_ssh_opts="-e 'ssh -J ${proxy_user}@${proxy}'"
+        fi
     fi
     
     if [[ -n "$ip" ]]; then
@@ -1285,7 +1353,7 @@ inventory_site() {
     
     # Extract values
     # V1.3 FIX: parse_wp_config outputs UPPERCASE (DB_NAME, DB_USER, etc.)
-    eval "$config_data"
+    _safe_load_config "$config_data"
     
     # Test DB connection
     test_db_connection "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" "$host" || {
@@ -1297,7 +1365,7 @@ inventory_site() {
     local blog_id=""
     local site_table_prefix="$TABLE_PREFIX"
     
-    if [[ "$is_multisite_flag" == "true" ]] || is_multisite "$wp_path" "$host"; then
+    if [[ "${IS_MULTISITE:-}" == "true" ]] || is_multisite "$wp_path" "$host"; then
         multisite_status="Yes"
         blog_id=$(get_blog_id_for_domain "$wp_path" "$domain" "$host")
         
@@ -1563,7 +1631,7 @@ create_backup() {
     # Parse config first to get DB name
     local config_data
     config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
-    eval "$config_data"
+    _safe_load_config "$config_data"
     
     validate_environment_match "$wp_path" "$DB_NAME" "$env" || return 1
     
@@ -1573,7 +1641,7 @@ create_backup() {
     local est_db_mb=0
     if [[ "$host" == "localhost" ]]; then
         est_files_mb=$(du -sm "$wp_path" 2>/dev/null | cut -f1 || echo "0")
-        est_db_mb=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e \
+        est_db_mb=$(mysql_safe "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" -sN -e \
             "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';" 2>/dev/null || echo "0")
     else
         est_files_mb=$(remote_exec "$host" "du -sm $wp_path 2>/dev/null | cut -f1" 2>/dev/null || echo "0")
@@ -1604,20 +1672,21 @@ create_backup() {
     fi
     
     # Backup database
-    # V1.3 FIX: Use UPPERCASE variables from eval (DB_NAME, DB_USER, DB_PASS, DB_HOST)
+    # V1.3 FIX: Use UPPERCASE variables from _safe_load_config (DB_NAME, DB_USER, DB_PASS, DB_HOST)
+    # V1.4 SECURITY: Local uses mysqldump_safe (hides password from ps); remote uses SSH string
     log_step "Backing up database: $DB_NAME"
     local db_dump="$backup_dir/db.sql.gz"
-    local dump_cmd="mysqldump -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" --single-transaction --routines --triggers \"$DB_NAME\" | gzip > \"$db_dump\""
     
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would back up database: $DB_NAME"
     else
         if [[ "$host" == "localhost" ]]; then
-            eval "$dump_cmd" || {
+            mysqldump_safe "$DB_HOST" "$DB_USER" "$DB_PASS" --single-transaction --routines --triggers "$DB_NAME" | gzip > "$db_dump" || {
                 log_error "Database backup failed"
                 return 1
             }
         else
+            local dump_cmd="mysqldump -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" --single-transaction --routines --triggers \"$DB_NAME\" | gzip > \"$db_dump\""
             remote_exec "$host" "$dump_cmd" || {
                 log_error "Database backup failed"
                 return 1
@@ -1753,7 +1822,7 @@ fi
 
 echo ""
 echo "Restoring database..."
-gunzip -c "$BACKUP_DIR/db.sql.gz" | mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME"
+gunzip -c "$BACKUP_DIR/db.sql.gz" | mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\n' "$DB_USER" "$DB_PASS") "$DB_NAME"
 
 echo "Restoring uploads..."
 mkdir -p "$WP_PATH/wp-content"
@@ -1945,7 +2014,7 @@ restore_backup() {
             if [[ -f "$wp_config_backup" ]]; then
                 local config_data
                 config_data=$(parse_wp_config "$wp_config_backup" "localhost")
-                eval "$config_data"
+                _safe_load_config "$config_data"
                 target_db_name="$DB_NAME"
                 # DB_USER, DB_PASS, DB_HOST are now set from eval
                 DB_HOST="${DB_HOST:-localhost}"
@@ -1960,7 +2029,7 @@ restore_backup() {
                 # Parse remotely by fetching content
                 local config_data
                 config_data=$(parse_wp_config "$wp_config_backup" "$host")
-                eval "$config_data"
+                _safe_load_config "$config_data"
                 target_db_name="$DB_NAME"
                 DB_HOST="${DB_HOST:-localhost}"
             else
@@ -1985,7 +2054,7 @@ restore_backup() {
     # Import database
     log_step "Importing database dump"
     if [[ "$host" == "localhost" ]]; then
-        gunzip -c "$db_dump" | mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$target_db_name" || {
+        gunzip -c "$db_dump" | mysql_safe "$DB_HOST" "$DB_USER" "$DB_PASS" "$target_db_name" || {
             log_error "Database import failed"
             return 1
         }
@@ -2267,7 +2336,9 @@ migrate_site() {
                 rsync -avz --progress "${SSH_USER}@${src_host}:${src_backup_dir}/" "$dst_backup_dir/"
             else
                 # Both remote - transfer through localhost
-                local temp_dir="/tmp/webdev-migrate-transfer-${RUN_TIMESTAMP}"
+                # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
+                local temp_dir
+                temp_dir=$(mktemp -d /tmp/webdev-migrate-transfer-XXXXXXXX)
                 mkdir -p "$temp_dir"
                 rsync -avz --progress "${SSH_USER}@${src_host}:${src_backup_dir}/" "$temp_dir/"
                 rsync -avz --progress "$temp_dir/" "${SSH_USER}@${dst_host}:${dst_backup_dir}/"
@@ -2364,7 +2435,7 @@ clone_live_to_test() {
     # Parse live config
     local config_data
     config_data=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
-    eval "$config_data"
+    _safe_load_config "$config_data"
     
     # V1.2: Validate live environment
     validate_environment_match "$live_wp_path" "$DB_NAME" "live" || return 1
@@ -2522,13 +2593,13 @@ promote_test_to_live() {
     live_config=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
     test_config=$(parse_wp_config "$test_wp_path/wp-config.php" "$host")
     
-    eval "$live_config"
+    _safe_load_config "$live_config"
     local live_db="$DB_NAME"
     local live_db_user="$DB_USER"
     local live_db_pass="$DB_PASS"
     local live_db_host="${DB_HOST:-localhost}"
     
-    eval "$test_config"
+    _safe_load_config "$test_config"
     local test_db="$DB_NAME"
     
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -2545,10 +2616,13 @@ promote_test_to_live() {
     
     # Step 2: Dump test database
     log_step "Dumping test database"
-    local temp_dump="/tmp/test-db-${RUN_TIMESTAMP}.sql"
+    # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
+    local temp_dump
+    temp_dump=$(mktemp /tmp/webdev-migrate-testdb-XXXXXXXX.sql)
     if [[ "$host" == "localhost" ]]; then
         # V1.3 FIX: Use credentials from parsed configs
-        mysqldump -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$test_db" > "$temp_dump" || {
+        # V1.4 SECURITY: Use mysqldump_safe to hide password from ps
+        mysqldump_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$test_db" > "$temp_dump" || {
             log_error "Failed to dump test database"
             return 1
         }
@@ -2562,7 +2636,7 @@ promote_test_to_live() {
     # Step 3: Import to live database
     log_step "Importing test data to live database"
     if [[ "$host" == "localhost" ]]; then
-        mysql -h "$live_db_host" -u "$live_db_user" -p"$live_db_pass" "$live_db" < "$temp_dump" || {
+        mysql_safe "$live_db_host" "$live_db_user" "$live_db_pass" "$live_db" < "$temp_dump" || {
             log_error "Failed to import to live database"
             return 1
         }
@@ -2703,7 +2777,7 @@ promote_subsite_to_standalone() {
     # Parse multisite config
     local ms_config
     ms_config=$(parse_wp_config "$multisite_path/wp-config.php" "$host")
-    eval "$ms_config"
+    _safe_load_config "$ms_config"
     local ms_db="$DB_NAME"
     local ms_db_user="$DB_USER"
     local ms_db_pass="$DB_PASS"
@@ -2746,7 +2820,9 @@ promote_subsite_to_standalone() {
     
     # Step 4: Export and import subsite tables
     log_step "Exporting subsite tables (blog_id: $blog_id)"
-    local temp_sql="/tmp/subsite-${blog_id}-${RUN_TIMESTAMP}.sql"
+    # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
+    local temp_sql
+    temp_sql=$(mktemp /tmp/webdev-migrate-subsite-XXXXXXXX.sql)
     
     # Get list of tables for this blog_id
     local blog_prefix="${ms_table_prefix}${blog_id}_"
@@ -2754,7 +2830,8 @@ promote_subsite_to_standalone() {
     if [[ "$host" == "localhost" ]]; then
         # Export blog-specific tables
         # V1.3 FIX: Add -h flag, proper spacing
-        local tables=$(mysql -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" -e "SHOW TABLES LIKE '${blog_prefix}%'" | tail -n +2 | tr '\n' ' ')
+        # V1.4 SECURITY: Use mysql_safe/mysqldump_safe to hide password from ps
+        local tables=$(mysql_safe "$ms_db_host" "$ms_db_user" "$ms_db_pass" "$ms_db" -e "SHOW TABLES LIKE '${blog_prefix}%'" | tail -n +2 | tr '\n' ' ')
         
         if [[ -z "$tables" ]]; then
             log_error "No tables found for blog_id: $blog_id"
@@ -2764,14 +2841,14 @@ promote_subsite_to_standalone() {
         log_info "Found tables: $tables"
         
         # Dump tables
-        mysqldump -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" $tables > "$temp_sql"
+        mysqldump_safe "$ms_db_host" "$ms_db_user" "$ms_db_pass" "$ms_db" $tables > "$temp_sql"
         
         # Also export users and usermeta
-        mysqldump -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" "${ms_table_prefix}users" "${ms_table_prefix}usermeta" >> "$temp_sql"
+        mysqldump_safe "$ms_db_host" "$ms_db_user" "$ms_db_pass" "$ms_db" "${ms_table_prefix}users" "${ms_table_prefix}usermeta" >> "$temp_sql"
         
         # Import to new database with prefix conversion
         log_step "Importing and converting table prefixes"
-        sed "s/${blog_prefix}/wp_/g" "$temp_sql" | sed "s/${ms_table_prefix}users/wp_users/g" | sed "s/${ms_table_prefix}usermeta/wp_usermeta/g" | mysql -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$target_db"
+        sed "s/${blog_prefix}/wp_/g" "$temp_sql" | sed "s/${ms_table_prefix}users/wp_users/g" | sed "s/${ms_table_prefix}usermeta/wp_usermeta/g" | mysql_safe "$ms_db_host" "$ms_db_user" "$ms_db_pass" "$target_db"
         
         rm "$temp_sql"
     else
@@ -2806,7 +2883,10 @@ promote_subsite_to_standalone() {
     
     # Step 6: Create clean wp-config.php
     log_step "Creating standalone wp-config.php"
-    cat > "/tmp/wp-config-new.php" <<WPCONFIG_EOF
+    # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
+    local tmp_wpconfig
+    tmp_wpconfig=$(mktemp /tmp/webdev-migrate-wpconfig-XXXXXXXX.php)
+    cat > "$tmp_wpconfig" <<WPCONFIG_EOF
 <?php
 define('DB_NAME', '$target_db');
 define('DB_USER', '$ms_db_user');
@@ -2827,15 +2907,15 @@ require_once ABSPATH . 'wp-settings.php';
 WPCONFIG_EOF
     
     if [[ "$host" == "localhost" ]]; then
-        sudo cp "/tmp/wp-config-new.php" "$target_wp_path/wp-config.php"
+        sudo cp "$tmp_wpconfig" "$target_wp_path/wp-config.php"
         sudo chown www-data:www-data "$target_wp_path/wp-config.php"
         sudo chmod 640 "$target_wp_path/wp-config.php"
     else
-        remote_copy "$host" "/tmp/wp-config-new.php" "$target_wp_path/wp-config.php" "to"
+        remote_copy "$host" "$tmp_wpconfig" "$target_wp_path/wp-config.php" "to"
         remote_exec "$host" "sudo chown www-data:www-data $target_wp_path/wp-config.php"
         remote_exec "$host" "sudo chmod 640 $target_wp_path/wp-config.php"
     fi
-    rm "/tmp/wp-config-new.php"
+    rm "$tmp_wpconfig"
     
     # Step 7: Update URLs
     log_step "Updating URLs to: https://$target_domain"
@@ -2919,7 +2999,7 @@ healthcheck_site() {
     print_section "Check 2: Database Connection"
     local config_data
     config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
-    eval "$config_data"
+    _safe_load_config "$config_data"
     
     if test_db_connection "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" "$host"; then
         log_success "✓ Database connection works"
@@ -3139,7 +3219,7 @@ GUIDE_EOF
     
     local config_data
     config_data=$(parse_wp_config "$wp_path/wp-config.php" "$host")
-    eval "$config_data"
+    _safe_load_config "$config_data"
     
     # Determine domain if not provided
     if [[ -z "$domain" ]]; then
@@ -3219,7 +3299,7 @@ GUIDE_EOF
         # Find top meta keys that might contain URLs
         if [[ "$host" == "localhost" ]]; then
             local meta_keys_with_urls
-            meta_keys_with_urls=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+            meta_keys_with_urls=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "
                 SELECT meta_key, COUNT(*) as cnt 
                 FROM $postmeta_table 
                 WHERE meta_value LIKE '%http%' 
@@ -3241,7 +3321,7 @@ GUIDE_EOF
             
             for key in "${plugin_keys[@]}"; do
                 local plugin_count
-                plugin_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                plugin_count=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "
                     SELECT COUNT(*) FROM $postmeta_table WHERE meta_key='$key';
                 " 2>/dev/null || echo 0)
                 
@@ -3251,7 +3331,7 @@ GUIDE_EOF
                     # Check for specific URL patterns in this key
                     for pattern in "testing.cs.earlham.edu" "http://" "/sites/"; do
                         local pattern_count
-                        pattern_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                        pattern_count=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "
                             SELECT COUNT(*) FROM $postmeta_table 
                             WHERE meta_key='$key' AND meta_value LIKE '%$pattern%';
                         " 2>/dev/null || echo 0)
@@ -3267,7 +3347,7 @@ GUIDE_EOF
             log_step "Checking custom post types..."
             local post_table="${site_table_prefix}posts"
             local custom_post_types
-            custom_post_types=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+            custom_post_types=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "
                 SELECT DISTINCT post_type FROM $post_table 
                 WHERE post_type NOT IN ('post', 'page', 'attachment', 'revision', 'nav_menu_item')
                 AND post_status != 'trash';
@@ -3277,7 +3357,7 @@ GUIDE_EOF
                 echo "Custom post types found:"
                 echo "$custom_post_types" | while read -r post_type; do
                     local type_count
-                    type_count=$(mysql -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" -N -e "
+                    type_count=$(mysql_safe "${DB_HOST:-localhost}" "$DB_USER" "$DB_PASS" "$DB_NAME" -N -e "
                         SELECT COUNT(*) FROM $post_table WHERE post_type='$post_type';
                     " 2>/dev/null || echo 0)
                     echo "  • $post_type ($type_count posts)"
@@ -3722,7 +3802,8 @@ get_db_password_with_help() {
             
             if [[ -n "$extracted_pass" ]]; then
                 log_success "  Password extracted from wp-config.php"
-                eval "$var_name=\"\$extracted_pass\""
+                # V1.4 SECURITY: Use printf -v instead of eval for safe indirect assignment
+                printf -v "$var_name" "%s" "$extracted_pass"
                 return 0
             else
                 log_warn "  Could not extract password automatically"
@@ -3737,7 +3818,8 @@ get_db_password_with_help() {
     local manual_pass
     read -r -sp "  Enter database password: " manual_pass
     echo ""
-    eval "$var_name=\"\$manual_pass\""
+    # V1.4 SECURITY: Use printf -v instead of eval for safe indirect assignment
+    printf -v "$var_name" "%s" "$manual_pass"
     return 0
 }
 
@@ -4092,10 +4174,11 @@ migrate_wizard_multi() {
     
     remote_exec "$dst_server" "mkdir -p $dst_backup_dir" 2>/dev/null
     
-    local temp_dir="/tmp/webdev-migrate-transfer-${RUN_TIMESTAMP}"
+    # V1.4 SECURITY: Use mktemp to avoid predictable temp paths
+    local temp_dir
+    temp_dir=$(mktemp -d /tmp/webdev-migrate-transfer-XXXXXXXX)
     # V1.3: Ensure cleanup even on failure
     trap "rm -rf '$temp_dir' 2>/dev/null || true" RETURN
-    mkdir -p "$temp_dir"
     
     log_info "  Downloading from $src_server..."
     remote_copy "$src_server" "$src_backup_dir/" "$temp_dir/" "from"
@@ -4229,12 +4312,15 @@ setup_server_wizard() {
             server_user="${server_user:-$USER}"
             
             echo ""
-            local needs_proxy proxy_host=""
+            local needs_proxy proxy_host="" proxy_user=""
             read -r -p "Does this require ProxyJump/jumphost? (y/N): " needs_proxy
             
             if [[ "$needs_proxy" == "y" || "$needs_proxy" == "Y" ]]; then
-                echo -e "💡 ${CYAN}ProxyJump format: user@jumphost or just jumphost${NC}"
-                read -r -p "ProxyJump hostname (e.g., jumphost.cs.earlham.edu): " proxy_host
+                echo -e "💡 ${CYAN}ProxyJump format: just the hostname (username is asked next)${NC}"
+                read -r -p "ProxyJump hostname (e.g., bowie.cs.earlham.edu): " proxy_host
+                # V1.4 FIX: Ask for proxy username to avoid root@ under sudo
+                read -r -p "SSH username for jumphost [$server_user]: " proxy_user
+                proxy_user="${proxy_user:-$server_user}"
             fi
             
             local description
@@ -4244,6 +4330,7 @@ setup_server_wizard() {
             SERVER_CONFIG["${server_name}.ip"]="$server_ip"
             SERVER_CONFIG["${server_name}.user"]="$server_user"
             SERVER_CONFIG["${server_name}.proxy"]="$proxy_host"
+            SERVER_CONFIG["${server_name}.proxy_user"]="$proxy_user"
             SERVER_CONFIG["${server_name}.description"]="$description"
             
             # Save profile
@@ -4252,7 +4339,7 @@ setup_server_wizard() {
             save_profile="${save_profile:-y}"
             
             if [[ "$save_profile" == "y" || "$save_profile" == "Y" ]]; then
-                save_server_profile "$server_name" "$server_ip" "$server_user" "$proxy_host" "$description"
+                save_server_profile "$server_name" "$server_ip" "$server_user" "$proxy_host" "$description" "$proxy_user"
             fi
             
             # Test connection
@@ -4770,7 +4857,7 @@ QUICK START FOR BEGINNERS:
 
 MULTI-SERVER QUICK START:
     # Add a remote server
-    sudo $SCRIPT_NAME add-server web 192.168.1.10 njalshe23
+    sudo $SCRIPT_NAME add-server web 192.168.1.10 njalshe23 --proxy bowie.cs.earlham.edu --proxy-user njalshe23
 
     # Test connection
     sudo $SCRIPT_NAME test-connection web
@@ -4957,11 +5044,17 @@ parse_arguments() {
                 
                 # Optional proxy from flag
                 local srv_proxy=""
-                if [[ "${4:-}" == "--proxy" ]]; then
-                    srv_proxy="${5:-}"
-                fi
+                local srv_proxy_user="$srv_user"
+                local i=4
+                while [[ -n "${!i:-}" ]]; do
+                    case "${!i}" in
+                        --proxy)       i=$((i+1)); srv_proxy="${!i:-}" ;;
+                        --proxy-user)  i=$((i+1)); srv_proxy_user="${!i:-}" ;;
+                    esac
+                    i=$((i+1))
+                done
                 
-                save_server_profile "$srv_name" "$srv_ip" "$srv_user" "$srv_proxy" ""
+                save_server_profile "$srv_name" "$srv_ip" "$srv_user" "$srv_proxy" "" "$srv_proxy_user"
                 
                 # Load and test
                 init_multi_server_session
