@@ -1,243 +1,94 @@
-# webdev-migrate Changelog
+# CHANGELOG - webdev-migrate v1.3.0 (Production Release)
 
-All notable changes to this project will be documented in this file.
+**Release Date:** February 2026  
+**Previous Version:** 1.2.1 (3,845 lines)  
+**Final Version:** 1.3.0 (5,029 lines, +1,184)  
+**Audit:** Passed Sonnet 4.5 deep audit. If that's not enough, I don't know what is.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+---
 
-## [1.2.0] - 2026-02-13
+## CRITICAL BUG FIXES (6/6 functions)
 
-### Added - Safety & Training Features
+### Database Variable Case Mismatch — ALL functions fixed
+`parse_wp_config()` returns UPPERCASE (`DB_NAME`, `DB_USER`, etc.) but operations used lowercase.
 
-**Operation Locking (Prevents Concurrent Operations)**
-- Added `flock`-based locking system to prevent multiple operations on same site
-- Lock acquisition in all major operations (backup, restore, migrate, clone, promote)
-- Clear error messages when lock cannot be acquired
-- Automatic lock cleanup on exit
-- Lock files stored in `/var/lock/webdev-migrate/`
+| Function | Fix Applied |
+|----------|------------|
+| `inventory_site()` | Uppercase vars in display, JSON, reports |
+| `create_backup()` | Uppercase vars in mysqldump + manifest |
+| `restore_backup()` | Credential resolution rewritten; `-h` flag; remote wp-config parsing |
+| `clone_live_to_test()` | Verified correct (uses `sudo mysql` root auth) |
+| `promote_test_to_live()` | Added `-h`/`-u`/`-p` credentials + error handling |
+| `promote_subsite_to_standalone()` | Fixed all 4 mysql/mysqldump + parsed `$ms_db_host` |
 
-**Dry-Run First (Interactive Mode Safety)**
-- Interactive menu now runs dry-run FIRST for destructive operations
-- Users see the plan before executing
-- Requires explicit "yes" confirmation after seeing dry-run
-- Applies to: Option 6 (promote test→live), Option 8 (promote subsite)
-- Prevents accidental destructive operations by beginners
+### Additional Fixes
+- Backup verification (file exists + non-empty + size shown)
+- mysqldump flag spacing: `-h "$HOST" -u "$USER"` (all functions)
+- Removed redundant config re-parse in `clone_live_to_test`
+- Dead code cleanup (`set -e` after `return 0`)
 
-**Environment Separation Enforcement**
-- New `validate_environment_match()` function
-- Validates that "live" points at live paths/databases
-- Validates that "test" points at testing paths/databases
-- Clear error messages showing what's wrong and what's expected
-- Prevents confusion and accidents
+---
 
-**Machine-Readable JSON Output**
-- Every inventory now generates `.json` alongside `.txt` report
-- Structured data for automation and tool integration
-- Contains all 8 FACTS in machine-readable format
-- Enables building registry systems and status dashboards
+## SAFETY ENHANCEMENTS
 
-**Deep Scan Decision Tree**
-- Added comprehensive guide in `url-audit` explaining when to use `--deep`
-- Real-world examples from production (DFlip case)
-- Decision flowchart for troubleshooting
-- Helps users self-diagnose plugin URL issues
+| Feature | Description |
+|---------|------------|
+| Pre-migration validation | 3-point check: WP-CLI, DB health, write access |
+| Rollback backup | Creates backup, handles failure, shows restore path |
+| Password helper | `get_db_password_with_help()` in `restore_backup()` |
+| Server name validation | Empty, special chars, reserved, duplicate checks |
+| Temp dir cleanup | `trap ... RETURN` for transfer temp |
+| Ping fallback | TCP port 22 when ping blocked |
+| **Backup size estimation** | Shows files + DB size before backup; warns if >1GB |
+| **Backup retention** | Auto-cleans backups older than 30 days (configurable) |
 
-**Serialization Safety Documentation**
-- Added critical comments explaining WordPress serialization
-- Documents why WP-CLI must be used (not sed/SQL)
-- Explains `s:5:"hello"` format and length requirements
-- Prevents developers from accidentally breaking databases
+---
 
-### Changed
+## NEW FEATURES
 
-- **Version**: Bumped to 1.2.0
-- **Line count**: 3,420 lines (+413 from v1.1)
-- **Lock directory**: Added `/var/lock/webdev-migrate/`
-- **Interactive menu**: Now defaults to safer workflow for destructive ops
-- **Environment validation**: Now runs automatically in backup/restore/clone operations
+- Multi-server session management (associative arrays, profiles)
+- Server profiles (`~/.webdev-migrate/servers/`)
+- SSH ProxyJump in `remote_exec`/`remote_copy` (with legacy fallback)
+- 5-point connection testing (+ TCP fallback)
+- Cross-server migration wizard (6 steps with validation + rollback)
+- Two-tier menu (Scope → Local / Multi-Server)
+- CLI: `multi-server`, `add-server`, `test-connection`, `server-profiles`
+- Configurable `BACKUP_RETENTION_DAYS` (default: 30, set in `~/.webdev-migrate.conf`)
 
-### Technical Details
+---
 
-- All major operations now acquire locks: `backup`, `restore`, `clone_live_to_test`, `promote_test_to_live`, `promote_subsite_to_standalone`
-- Lock cleanup handled automatically via `cleanup_on_exit` trap
-- Environment validation checks both path AND database name for consistency
-- JSON output includes all metadata with proper escaping and null handling
-- Deep scan guide integrated into tool workflow (not just docs)
+## UNCHANGED
 
-### Deployment Notes
+- `set -o pipefail` (no `-eo`) · `$((var + 1))` (no `((var++))`)
+- All v1.2.1 UX: startup tips, inline help, sudo check, quick reference, site discovery
+- Lock system, dry-run, confirmation strings, all existing CLI commands
 
-**No Breaking Changes**
-- Drop-in replacement for v1.1
-- Same command syntax
-- Same configuration format
-- Existing backups remain compatible
+---
 
-**New Requirements**
-- `flock` command (standard on most Linux systems)
-- Write access to `/var/lock/webdev-migrate/` (auto-created)
+## TESTING
 
-**Migration from v1.1**
 ```bash
-sudo cp webdev-migrate /usr/local/bin/
-sudo chmod +x /usr/local/bin/webdev-migrate
-webdev-migrate --help  # Should show v1.2.0
+bash -n webdev-migrate                    # Syntax
+sudo webdev-migrate list-all-sites        # Regression
+sudo webdev-migrate backup /var/www/wordpress-testing-fieldscience fieldscience test  # Size estimate + retention
+sudo webdev-migrate restore /srv/backups/wp/fieldscience/test/TIMESTAMP /tmp/test-restore
+sudo webdev-migrate add-server web 192.168.1.10 njalshe23 --proxy jumphost.cs.earlham.edu
+sudo webdev-migrate test-connection web
+sudo webdev-migrate multi-server
 ```
 
----
+## DEPLOYMENT
 
-## [1.1.0] - 2025-12-01
+```bash
+cd /tmp && git clone https://code.cs.earlham.edu/njalshe23/webdev-migrate.git
+bash -n webdev-migrate/webdev-migrate
+sudo cp webdev-migrate/webdev-migrate /usr/local/bin/
+sudo chmod +x /usr/local/bin/webdev-migrate
+```
 
-### Added - Production Hardening
-
-**Multisite Context Detection**
-- Automatic blog_id resolution from domain
-- Correct table prefix detection (wp_10_* vs wp_*)
-- Context-aware WP-CLI flags (`--url=` or `--blog=`)
-- Functions: `get_blog_id_for_domain()`, `get_wp_cli_context()`, `get_table_prefix_for_blog()`
-
-**HTTPS Detection Without is_ssl()**
-- Three-tier detection: siteurl option → curl test → default HTTPS
-- Function: `detect_site_scheme()`
-- No longer relies on PHP's is_ssl() which fails in CLI
-- Prevents mixed-protocol URLs
-
-**THE 8 FACTS Standardized Output**
-- Consistent inventory format for training
-- Shows: domain, server, path, database, environment, multisite context, uploads, theme/plugins
-- Builds muscle memory for operators
-- Saved to timestamped report files
-
-**Restore Verification**
-- Automated 6-point verification after restore
-- Checks: WordPress core, database integrity, URL options, plugins, uploads, external access
-- Clear PASS/FAIL summary
-- Catches issues before deployment
-
-**Deep URL Scanning**
-- `--deep` flag for scanning plugin metadata
-- Finds URLs in serialized data (like `_dflip_data`)
-- Reports top 20 meta keys with URLs
-- Detects custom post types
-- Guided replacement with verification
-
-**Multisite as LEGACY**
-- Menu and docs emphasize multisite is being phased out
-- Clear recommendation: convert to standalone
-- Updated terminology throughout
-
-### Changed
-
-- **Version**: Bumped to 1.1.0
-- **Line count**: 3,007 lines (+667 from v1.0)
-- All `get_wp_option()` calls now accept domain for multisite context
-- Inventory output completely redesigned
-- Restore operation now includes verification step
-
-### Fixed
-
-- Wrong table prefix bug in multisite (was querying wp_posts instead of wp_10_posts)
-- HTTPS detection failures in WP-CLI context
-- Inconsistent inventory output format
-- No feedback on restore success/failure
-- Plugin URLs in serialized metadata not updated
-- Confusing multisite messaging
-
----
-
-## [1.0.0] - 2025-10-03
-
-### Added - Initial Release
-
-**Core Operations**
-- Site inventory with auto-discovery
-- Backup creation with manifests
-- Restore from backup
-- Cross-server migration
-- Live→test cloning
-- Test→live promotion
-- Multisite subsite listing
-- Subsite→standalone conversion
-- Health checks
-- URL audit and fix
-
-**Safety Features**
-- Dry-run mode for all operations
-- Automatic backups before destructive operations
-- Multiple confirmation levels
-- Comprehensive logging
-- Preflight validation checks
-
-**User Experience**
-- Interactive menu for beginners
-- Command-line interface for automation
-- Color-coded output
-- Clear error messages
-- Training-focused output
-
-**Documentation**
-- README.md - Complete reference
-- TRAINING.md - Beginner's guide
-- WALKTHROUGHS.md - Step-by-step examples
-- QUICKSTART.md - 5-minute start
-- IMPLEMENTATION.md - Technical details
-- webdev-migrate.conf.example - Configuration template
-
-### Technical Details
-
-- **Line count**: 2,340 lines
-- **Architecture**: Single monolithic Bash script
-- **Dependencies**: bash, mysql-client, wp-cli, apache2, rsync, ssh, gzip, tar
-- **Standard paths**: `/var/www/`, `/srv/backups/wp/`, `/var/log/webdev-migrate/`
-
----
-
-## Version Comparison
-
-| Feature | v1.0 | v1.1 | v1.2 |
-|---------|------|------|------|
-| **Line Count** | 2,340 | 3,007 | 3,420 |
-| **Operations** | 10 | 10 | 10 |
-| **Multisite context** | Basic | Full | Full |
-| **HTTPS detection** | is_ssl() | Reliable | Reliable |
-| **Inventory format** | Basic | THE 8 FACTS | THE 8 FACTS + JSON |
-| **Restore verification** | No | Yes (6-point) | Yes (6-point) |
-| **Deep URL scan** | No | Yes | Yes + Guide |
-| **Operation locking** | No | No | Yes |
-| **Environment validation** | No | No | Yes |
-| **Dry-run default** | Optional | Optional | Interactive default |
-
----
-
-## Upgrade Path
-
-### v1.0 → v1.1
-- Drop-in replacement
-- No config changes needed
-- Immediate benefits from all fixes
-
-### v1.1 → v1.2
-- Drop-in replacement
-- Lock directory auto-created
-- Interactive workflow slightly changed (dry-run first)
-
-### v1.0 → v1.2 (Skip v1.1)
-- Fully supported
-- All v1.1 + v1.2 features available
-- Recommended upgrade path
-
----
-
-## Credits
-
-- **Primary Developer**: Nour Al-Sheikh (njalshe23@earlham.edu)
-- **AI Assistant**: All the AI in the universe at this point. (I left similar easter-eggs around the documentation)
-- **Testing & Feedback**: EC Webdev Team
-- **Incident That Drove v1.1**: earlhamword.com DFlip migration debugging
-- **Safety Features (v1.2)**: Based on production experience and peer feedback
-
----
-
-## License
-
-Internal tool for Earlham College Computer Science Department.
-Not licensed for external distribution.
+```bash
+git add webdev-migrate
+git commit -m "v1.3.0 - Production release: DB fixes + multi-server + safety"
+git tag -a v1.3.0 -m "Version 1.3.0 - Production ready"
+git push origin main --tags
+```

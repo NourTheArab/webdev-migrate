@@ -1,0 +1,50 @@
+# Server Profile Example
+# Save this as: ~/.webdev-migrate/servers/SERVERNAME.conf
+
+# Basic Info
+SERVER_NAME="web"
+SERVER_IP="192.168.1.10"
+SERVER_USER="njalshe23"
+
+# ProxyJump Configuration (if needed)
+# Leave empty if direct SSH access works
+SERVER_PROXY="jumphost.cs.earlham.edu"
+SERVER_PROXY_USER="njalshe23"
+
+# Optional Description
+SERVER_DESCRIPTION="Production server (old infrastructure)"
+
+# SSH Key Path (optional - defaults to ~/.ssh/id_rsa)
+SSH_KEY_PATH="${HOME}/.ssh/id_rsa"
+
+# Auto-updated by tool (don't edit these manually)
+LAST_TEST_DATE=""
+LAST_TEST_STATUS=""
+SITES_FOUND=""
+
+# ═══════════════════════════════════════════════════════════════
+# USAGE
+# ═══════════════════════════════════════════════════════════════
+#
+# 1. Copy this file to ~/.webdev-migrate/servers/
+# 2. Rename to match your server (e.g., web.conf, web-urey.conf)
+# 3. Edit the values above
+# 4. Test with: webdev-migrate test-connection SERVERNAME
+#
+# ═══════════════════════════════════════════════════════════════
+# EXAMPLES
+# ═══════════════════════════════════════════════════════════════
+#
+# Direct SSH (no ProxyJump):
+#   SERVER_NAME="backup"
+#   SERVER_IP="192.168.1.30"
+#   SERVER_USER="njalshe23"
+#   SERVER_PROXY=""
+#
+# With ProxyJump (Earlham network):
+#   SERVER_NAME="web"
+#   SERVER_IP="192.168.1.10"
+#   SERVER_USER="njalshe23"
+#   SERVER_PROXY="jumphost.cs.earlham.edu"
+#
+# ═══════════════════════════════════════════════════════════════

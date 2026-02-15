@@ -1,258 +1,309 @@
-# webdev-migrate v1.2.0
+# webdev-migrate v1.3.0
 
-**Production WordPress Management Tool - Beginner-Proof | Made by Nour**
-
-Version 1.2.0 | 3,420 lines | Finished on February 13, 2026
-
----
-
-**A Note:**
-- This was a passion project I started in frustration from the various incomplete and often faulty migration scripts we had. The purpose of this project is to pass-down information and ease the process of future migrations, even if we do eventually move to full VMs.
-
-## What's New in v1.2?
-
-**6 Safety Features for Training Beginners:**
-
-- **Operation Locking** - Prevents concurrent operations from corrupting data
-- **Dry-Run First** - Shows plan before executing destructive operations  
-- **Environment Validation** - Prevents mixing live/test
-- **JSON Output** - Machine-readable inventory
-- **Decision Trees** - Built-in guides (when to use --deep)
--  **Safety Docs** - Critical serialization warnings
-
-**[Read Full v1.2 Update Summary →](UPDATE-SUMMARY-v1.2.md)**
+**The WordPress Tool That Actually Makes Sense**  
+*Built by a human who got frustrated and inherited a mess, for humans who will hopefully not experience that afterwards*
 
 ---
 
-## Quick Start
+## Hi, I'm Nour
+
+I built this because I was tired of:
+- Scripts that half-worked
+- Migrations that broke plugins  
+- Testing environments that didn't match production
+- Watching new people make the same mistakes
+
+So I made **one tool that does everything right, once.**
+
+This isn't just code. This is 4 months of debugging earlhamword.com's DFlip plugin, countless "why did the URLs break?" moments, and a lot of coffee. It's meant to be **passed down** — so the next person doesn't have to learn the hard way.
+
+---
+
+## Quick Start (30 Seconds)
 
 ```bash
 # Install
 sudo cp webdev-migrate /usr/local/bin/
 sudo chmod +x /usr/local/bin/webdev-migrate
 
-# Run (interactive menu)
+# Run
 webdev-migrate
 
-# Or use directly
-webdev-migrate inventory portfolios.cs.earlham.edu
+# That's it. Really.
 ```
 
-**[Complete Installation Guide →](QUICKSTART.md)**
+**Never used it before?** Type `webdev-migrate` with no arguments. The interactive menu will guide you.
+
+**[5-Minute Tutorial →](QUICKSTART.md)**
 
 ---
 
-## 📋 Features
+## What Can This Do?
 
-| Operation | Safety | Description |
-|-----------|--------|-------------|
-| **inventory** | Safe | Show THE 8 FACTS + JSON output |
-| **backup** | Locked | Create restorable backup |
-| **restore** | Verified | Restore with 6-point checks |
-| **migrate** | Careful | Cross-server migration |
-| **clone-to-test** | Locked | Create testing environment |
-| **promote-to-live** | Dry-run first | Deploy test to production |
-| **healthcheck** | Safe | Comprehensive diagnostics |
-| **url-audit --deep** | Safe | Find plugin URL issues |
+### On One Server (Local Mode)
+- **Inventory** — Show THE 8 FACTS about any site
+- **Backup** — Create backups that actually work when you need them (with size estimation!)
+- **Restore** — With automatic verification
+- **Clone** — Make perfect test copies  
+- **Health Check** — 7-point diagnostic
+- **URL Audit** — Find plugin metadata issues (looking at you, DFlip)
 
-**v1.2 Safety:**
-- Operations locked (one at a time per site)
-- Environment validated (can't mix live/test)
-- Dry-run shown first (for destructive ops)
-- Restore verified (6 automated checks)
+### Across Servers (Multi-Server Mode) ← NEW in v1.3!
+- **List sites** across multiple servers at once
+- **Migrate** between servers with safety checks
+- **SSH ProxyJump** support (because our network is complicated, and honestly it's way less complicated than other clusters.)
+- **Server profiles** (save your configs, stop typing IPs)
 
----
-
-## Documentation
-
-### Getting Started
-- **[QUICKSTART.md](QUICKSTART.md)** - 5-minute start
-- **[TRAINING.md](TRAINING.md)** - Complete beginner's guide
-
-### Reference
-- **[CHANGELOG.md](CHANGELOG.md)** - Version history
-- **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Technical details  
-- **[WALKTHROUGHS.md](WALKTHROUGHS.md)** - Step-by-step examples
-
-### Updates
-- **[UPDATE-SUMMARY-v1.2.md](UPDATE-SUMMARY-v1.2.md)** - What's new in v1.2
-- **[UPDATE-SUMMARY-v1.1.md](UPDATE-SUMMARY-v1.1.md)** - What changed in v1.1
-
-### Version Archives
-- **[versions/v1.0/](versions/v1.0/)** - v1.0 documentation
-- **[versions/v1.1/](versions/v1.1/)** - v1.1 documentation
+All with **safety built in**:
+- Operation locking (no concurrent chaos)
+- Pre-migration validation (real checks, dry-runs)
+- Rollback backups (undo button for migrations)
+- Environment validation (can't mix live/test)
+- Automatic backup cleanup (30 days retention, configurable)
 
 ---
 
-## Common Commands
+## The Philosophy
 
-### Daily Operations
+**Three core principles:**
+
+### 1. Beginner-Proof
+New to WordPress migrations? This tool **teaches** as it works:
+- Every prompt has inline help
+- Errors explain what went wrong AND how to fix it
+- "THE 8 FACTS" format builds muscle memory
+- Validation mode lets you learn without fear
+
+### 2. Production-Ready
+Built from real production pain:
+- Used on earlhamword.com (multisite, 50+ ghost subsites that weren't terminated properly)
+- Handles DFlip plugin weirdness, amongst other plugins that embed links in serialized data
+- Deals with our ProxyJump network setup  
+
+### 3. Pass-It-Down
+This will outlive my time at Earlham:
+- Comprehensive documentation (not just code comments, full documentation)
+- Training guide for the next person, or an educational program to teach the server-side operations of wordpress.
+- Walkthroughs for common tasks
+- Philosophy doc explains WHY decisions were made
+
+**[Read Full Philosophy →](docs/PHILOSOPHY.md)**
+
+---
+
+## What's New in v1.3?
+
+### Multi-Server Capabilities
 ```bash
-# Check a site (THE 8 FACTS)
-webdev-migrate inventory portfolios.cs.earlham.edu
+# Add a server once, save it forever
+webdev-migrate add-server web 192.168.1.10 njalshe23 --proxy jumphost.cs.earlham.edu
 
-# Health check
-webdev-migrate healthcheck portfolios.cs.earlham.edu
-
-# Backup
-webdev-migrate backup /var/www/wordpress-site site live
+# Migrate between servers
+webdev-migrate multi-server
+# Interactive wizard walks you through it
 ```
 
-### Migration
-```bash
-# Dry-run first (ALWAYS)
-webdev-migrate --dry-run migrate web:site web-urey:site
+### Better Safety
+- **Real validation** before migrations (WP-CLI check, DB health, write access)
+- **Rollback backups** created automatically (asks first, handles failures)
+- **Size estimation** before large backups (warns if >1GB)
+- **Auto-cleanup** of old backups (30 days default, configurable)
 
-# Execute
-webdev-migrate migrate web:site web-urey:site
-```
-
-### URL Issues
-```bash
-# Standard scan
-webdev-migrate url-audit /var/www/site
-
-# Deep scan (for plugin metadata - DFlip, galleries, etc.)
-webdev-migrate url-audit --deep /var/www/site
-```
-
----
-
-## THE 8 FACTS
-
-Every inventory shows:
-
-1. **DOMAIN** - What domain?
-2. **SERVER** - Which machine?
-3. **WORDPRESS PATH** - Where are files?
-4. **DATABASE** - Name, user, host
-5. **ENVIRONMENT** - Live or test?
-6. **MULTISITE CONTEXT** - Blog ID? Table prefix?
-7. **UPLOADS CONFIG** - Path, URL, sites/<id>?
-8. **THEME & PLUGINS** - Active theme, plugin count
-
-*Standardized format builds training muscle memory.*
-
----
-
-## Version History
-
-| Version | Date | Lines | Key Features |
-|---------|------|-------|--------------|
-| **1.2.0** | Feb 13, 2025 | 3,420 | Safety (locking, validation) |
-| 1.1.0 | December 1, 2025 | 3,007 | Production hardening |
-| 1.0.0 | October 3, 2025 | 2,340 | Initial unified tool |
+### All Database Bugs Fixed
+v1.2.1 had critical issues with database operations. v1.3.0 **fixes all 6 affected functions**. Backups, restores, clones, promotions — all work now.
 
 **[Complete Changelog →](CHANGELOG.md)**
 
 ---
 
-## Upgrade from v1.1
+## Documentation
 
-Drop-in replacement:
+**Start Here:**
+- **[QUICKSTART.md](QUICKSTART.md)** — 5-minute start (truly)
+- **[PHILOSOPHY.md](docs/PHILOSOPHY.md)** — Why this exists, design decisions
 
-```bash
-sudo cp webdev-migrate /usr/local/bin/
-sudo chmod +x /usr/local/bin/webdev-migrate
-```
+**Learn:**
+- **[TRAINING.md](docs/TRAINING.md)** — Complete beginner's guide (1 hour)
+- **[WALKTHROUGHS.md](docs/WALKTHROUGHS.md)** — Real examples with context
+- **[MULTI-SERVER.md](docs/MULTI-SERVER.md)** — Cross-server migration guide
 
-No config changes needed. New safety features work immediately.
-
----
-
-## Configuration
-
-Optional `~/.webdev-migrate.conf`:
-
-```bash
-SOURCE_HOST="web"
-DEST_HOST="web-urey"
-SSH_USER="root"
-WEBROOT="/var/www"
-BACKUP_ROOT="/srv/backups/wp"
-```
-
-**[Full Config Example →](webdev-migrate.conf.example)**
+**Reference:**
+- **[IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** — How it works under the hood
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — Common issues & fixes
+- **[CHANGELOG.md](CHANGELOG.md)** — Version history
 
 ---
 
-## Troubleshooting
+## Common Tasks
 
-### "Another operation is already running"
+### Check a Site (THE 8 FACTS)
 ```bash
-# Check lock
-ls /var/lock/webdev-migrate/
+webdev-migrate inventory portfolios.cs.earlham.edu
+```
+Shows: domain, server, path, database, environment, multisite status, uploads config, theme/plugins.
 
-# If stuck, remove
-sudo rm /var/lock/webdev-migrate/SITE.lock
+### Make a Backup
+```bash
+webdev-migrate backup /var/www/wordpress-portfolios portfolios live
+```
+Creates timestamped backup with verification. Shows size estimate first. Auto-cleans old backups.
+
+### Migrate Between Servers
+```bash
+# Interactive mode (recommended for beginners)
+webdev-migrate multi-server
+
+# Or direct command (for pros)
+webdev-migrate migrate web:portfolios web-urey:portfolios
 ```
 
-### "Environment mismatch"
+### Fix Plugin URLs After Migration
 ```bash
-# Fix: Point at correct path
-# For test: /var/www/wordpress-testing-SITE
-# For live: /var/www/wordpress-SITE
-```
+# Standard scan
+webdev-migrate url-audit /var/www/site
 
-### Plugin URLs broken after migration
-```bash
-# Use deep scan
+# Deep scan (checks plugin metadata - for DFlip, galleries, etc.)
 webdev-migrate url-audit --deep /var/www/site
 ```
 
-**[Complete Troubleshooting →](TRAINING.md#part-7-what-can-go-wrong)**
+**[More Examples →](docs/WALKTHROUGHS.md)**
 
 ---
 
-## Support
+## Version History
 
-- **Tool questions:** njalshe23@earlham.edu (Nour)
+| Version | Date | Lines | What Changed |
+|---------|------|-------|-------------|
+| **1.3.0** | Feb 2026 | 5,029 | Multi-server + all DB bugs fixed + size estimation + retention |
+| 1.2.1 | Feb 2026 | 3,845 | Beginner UX improvements (site discovery, health checks) |
+| 1.2.0 | Feb 2026 | 3,420 | Safety features (locking, validation, dry-run) |
+| 1.1.0 | Dec 2025 | 3,007 | Production hardening (earlhamword.com lessons) |
+| 1.0.0 | Oct 2025 | 2,340 | Initial unified tool (replaced 5 separate scripts) |
+
+**[Detailed Changelog →](CHANGELOG.md)**
+
+---
+
+## Help
+
+### "I've never done this before"
+Start here: **[TRAINING.md](docs/TRAINING.md)**  
+It's written for absolute beginners. Takes about an hour. Worth it.
+
+### "Something broke"
+Check: **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**  
+Common issues with step-by-step solutions.
+
+### "The tool won't let me do something"
+That's probably **on purpose**. Read the error message — it explains why and what to do instead.
+
+### "I need to talk to a human"
+- **Tool questions:** njalshe23@earlham.edu, @NourTheArab on IG (Nour)
 - **Infrastructure:** Porter (sysadmin) / Charlie (webdev)
-- **Logs:** `/var/log/webdev-migrate/`
+- **Logs:** `/var/log/webdev-migrate/` (check these first!)
 
 ```bash
-# Check logs
+# View recent logs
 ls -lt /var/log/webdev-migrate/
-tail -100 /var/log/webdev-migrate/LATEST.log
+tail -100 /var/log/webdev-migrate/webdev-migrate-LATEST.log
 ```
+
+---
+
+## Contributing
+
+Found a bug? Have an idea?
+
+1. **Check logs first:** `/var/log/webdev-migrate/`
+2. **Read troubleshooting:** [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+3. **Open an issue** on GitLab with logs + steps to reproduce
+
+Want to improve the docs? **YES PLEASE.** Documentation PRs are worth their weight in gold.
+
+---
+
+## A Note to Future Maintainers
+
+Hi future person!
+
+If you're reading this, I've probably graduated and you've inherited this tool, or are interested in the server-side ops of WP. Here's what you should know:
+
+**This tool was built to solve real problems:**
+- earlhamword.com multisite migrations (the pain was real)
+- DFlip plugin URL issues (serialized data in plugin metadata)
+- Testing environment setup (make it match production exactly)
+- Training new webdev team members (teach them the right way)
+
+**It's not perfect, but it works.** If something seems weird, there's usually a reason — check the [PHILOSOPHY.md](docs/PHILOSOPHY.md) doc. I tried to explain the "why" behind weird decisions.
+
+**Feel free to improve it!** But please:
+- Keep the beginner-friendly approach (future you will thank you)
+- Don't break backward compatibility without major version bump
+- Update the docs when you change things (seriously, do this)
+- Add your own notes to PHILOSOPHY.md (explain your decisions too)
+
+The goal was never "perfect code." The goal was "the next person doesn't suffer like I did."
+
+Good luck! You've got this.
+
+— Nour (Class of 2027)
+
+---
+
+## License
+
+Made for Earlham College Webdev Team. Use it, improve it, pass it down.
+
+If you use this elsewhere, credit would be nice but not required. Just help the next person like I tried to help you.
 
 ---
 
 ## Credits
 
 - **Developer:** Nour Al-Sheikh
-- **AI Assistant:** I lost count. Consider this my disclosure. :)
-- **Testing:** EC Webdev.
-- **v1.1 Driver:** earlhamword.com DFlip debugging.
-- **v1.2 Design:** Production personal experience.
+- **AI Assistant:** NotebookLLM/GPT5.2/Claude/Gemini
+- **Testing:** EC Webdev team 
+- **v1.1 Driver:** earlhamword.com DFlip debugging hell (never again)
+- **v1.2 Design:** Real production experience pain points
+- **v1.3 Design:** "Why can't we migrate between servers easily?" frustration
 
 ---
 
-## Quick Reference
+## Quick Reference Card
 
 ```bash
-# Safety first
---dry-run                      # Always safe
+# SAFETY FIRST
+--dry-run                      # Always safe (shows what would happen)
 
-# Core operations
-inventory DOMAIN               # Check site
-backup PATH SLUG ENV           # Backup
-restore BACKUP PATH            # Restore
-migrate SRC DST                # Move
-clone-to-test SLUG             # Test copy
-promote-to-live SLUG           # Deploy
+# CORE OPERATIONS
+inventory DOMAIN               # Check site (THE 8 FACTS)
+backup PATH SLUG ENV           # Create backup
+restore BACKUP PATH            # Restore backup
+migrate SRC DST                # Move between servers
+clone-to-test SLUG             # Create test copy
+promote-to-live SLUG           # Deploy test → live
 
-# URL issues
-url-audit PATH                 # Standard
-url-audit --deep PATH          # Plugin scan
+# URL ISSUES
+url-audit PATH                 # Standard URL scan
+url-audit --deep PATH          # Deep scan (plugin metadata)
 
-# Help
---help                         # Full help
-(no args)                      # Interactive menu
+# MULTI-SERVER (v1.3)
+multi-server                   # Interactive multi-server mode
+add-server NAME IP USER        # Add server to session
+test-connection NAME           # Test server connection
+server-profiles                # List saved servers
+
+# HELP
+--help                         # Full command reference
+(no arguments)                 # Interactive menu
 ```
 
 ---
 
-**For complete documentation, see the individual `.md` files.**
+**Questions? Start with [QUICKSTART.md](QUICKSTART.md) or [TRAINING.md](docs/TRAINING.md)**
 
-**Questions? Check [TRAINING.md](TRAINING.md) or [WALKTHROUGHS.md](WALKTHROUGHS.md)**
+**Need specific examples? Check [WALKTHROUGHS.md](docs/WALKTHROUGHS.md)**
+
+**Want to understand how it works? Read [IMPLEMENTATION.md](docs/IMPLEMENTATION.md)**
+
+**Multi-server questions? See [MULTI-SERVER.md](docs/MULTI-SERVER.md)**

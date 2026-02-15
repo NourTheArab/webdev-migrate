@@ -2,10 +2,11 @@
 
 #==============================================================================
 # webdev-migrate: Unified WordPress Migration & Management Tool
-# Version: 1.2.1
+# Version: 1.3.0
 # Description: Complete WordPress site management for university web teams
 #              Handles backup, restore, migration, cloning, and multisite conversions
-#              V1.2.1: Beginner UX improvements (site discovery, inline help, sudo check)
+#             Made for Earlham College Web Dev team
+#             By Nour Al-Sheikh (Class of 2027)
 #==============================================================================
 
    set -o pipefail
@@ -14,7 +15,7 @@
 # GLOBAL CONFIGURATION
 #==============================================================================
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_TIME=$(date +%s)
@@ -41,6 +42,7 @@ SSH_USER="${SSH_USER:-$DEFAULT_SSH_USER}"
 WEBROOT="${WEBROOT:-$DEFAULT_WEBROOT}"
 BACKUP_ROOT="${BACKUP_ROOT:-$DEFAULT_BACKUP_ROOT}"
 LOG_DIR="${LOG_DIR:-$DEFAULT_LOG_DIR}"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
 
 # Global flags
 DRY_RUN=false
@@ -54,6 +56,16 @@ FORCE=false
 LOCK_DIR="/var/lock/webdev-migrate"
 GLOBAL_LOCK_FD=""
 GLOBAL_LOCK_FILE=""
+
+# Multi-server session management (V1.3)
+declare -A SERVER_CONFIG      # Stores server configurations
+declare -A SERVER_STATUS      # Connection status for each server
+declare -a ACTIVE_SERVERS     # Array of active server names in session
+CURRENT_SCOPE="local"         # "local" or "multi"
+
+# Server profiles directory (V1.3)
+PROFILE_DIR="${HOME}/.webdev-migrate/servers"
+mkdir -p "$PROFILE_DIR" 2>/dev/null || true
 
 # Colors (disabled if not a TTY)
 if [[ -t 1 ]]; then
@@ -655,7 +667,7 @@ test_db_connection() {
     
     log_step "Testing database connection"
     
-    local test_cmd="mysql -h\"$db_host\" -u\"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
+    local test_cmd="mysql -h \"$db_host\" -u \"$db_user\" -p\"$db_pass\" \"$db_name\" -e 'SELECT 1;' >/dev/null 2>&1"
     
     if [[ "$host" == "localhost" ]]; then
         if eval "$test_cmd"; then
@@ -903,35 +915,342 @@ get_table_prefix_for_blog() {
 }
 
 #==============================================================================
-# REMOTE EXECUTION HELPERS
+# MULTI-SERVER SESSION MANAGEMENT (V1.3)
 #==============================================================================
 
-remote_exec() {
-    local host="$1"
-    shift
-    local command="$*"
+init_multi_server_session() {
+    log_debug "Initializing multi-server session"
     
-    if [[ "$host" == "localhost" ]]; then
-        eval "$command"
+    local local_hostname
+    local_hostname=$(hostname 2>/dev/null || echo "localhost")
+    SERVER_CONFIG["localhost.ip"]="127.0.0.1"
+    SERVER_CONFIG["localhost.user"]="$(whoami)"
+    SERVER_CONFIG["localhost.hostname"]="$local_hostname"
+    SERVER_STATUS["localhost"]="connected"
+    ACTIVE_SERVERS=("localhost")
+    
+    log_success "Multi-server session initialized (localhost added)"
+}
+
+load_server_profile() {
+    local profile_name="$1"
+    local profile_file="${PROFILE_DIR}/${profile_name}.conf"
+    
+    if [[ ! -f "$profile_file" ]]; then
+        log_error "Profile not found: $profile_name"
+        log_info "Available profiles:"
+        list_saved_profiles
+        return 1
+    fi
+    
+    log_step "Loading server profile: $profile_name"
+    
+    # Source the profile (variables defined inside)
+    local SERVER_NAME="" SERVER_IP="" SERVER_USER="" SERVER_PROXY="" SERVER_PROXY_USER="" SERVER_DESCRIPTION=""
+    source "$profile_file"
+    
+    if [[ -z "$SERVER_NAME" || -z "$SERVER_IP" ]]; then
+        log_error "Profile '$profile_name' is incomplete (missing SERVER_NAME or SERVER_IP)"
+        return 1
+    fi
+    
+    SERVER_CONFIG["${SERVER_NAME}.ip"]="$SERVER_IP"
+    SERVER_CONFIG["${SERVER_NAME}.user"]="${SERVER_USER:-$(whoami)}"
+    SERVER_CONFIG["${SERVER_NAME}.proxy"]="${SERVER_PROXY:-}"
+    SERVER_CONFIG["${SERVER_NAME}.proxy_user"]="${SERVER_PROXY_USER:-}"
+    SERVER_CONFIG["${SERVER_NAME}.description"]="${SERVER_DESCRIPTION:-}"
+    
+    log_success "Loaded profile: $SERVER_NAME ($SERVER_IP)"
+    echo "$SERVER_NAME"
+}
+
+save_server_profile() {
+    local name="$1"
+    local ip="$2"
+    local user="$3"
+    local proxy="${4:-}"
+    local description="${5:-}"
+    
+    local profile_file="${PROFILE_DIR}/${name}.conf"
+    
+    cat > "$profile_file" <<PROFILE_EOF
+# Server profile: $name
+# Created: $(date)
+# Last used: $(date)
+
+SERVER_NAME="$name"
+SERVER_IP="$ip"
+SERVER_USER="$user"
+SERVER_PROXY="$proxy"
+SERVER_PROXY_USER="$user"
+SERVER_DESCRIPTION="$description"
+
+SSH_KEY_PATH="\${HOME}/.ssh/id_rsa"
+
+LAST_TEST_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
+LAST_TEST_STATUS="untested"
+SITES_FOUND="0"
+PROFILE_EOF
+    
+    log_success "Profile saved: $profile_file"
+}
+
+list_saved_profiles() {
+    echo ""
+    echo "Saved server profiles:"
+    echo ""
+    
+    if [[ ! -d "$PROFILE_DIR" ]] || [[ -z "$(ls -A "$PROFILE_DIR" 2>/dev/null)" ]]; then
+        echo "  (no saved profiles)"
+        echo ""
+        echo "  Create one with Multi-Server Mode → Add server"
+        echo ""
+        return 0
+    fi
+    
+    for profile in "$PROFILE_DIR"/*.conf; do
+        [[ ! -f "$profile" ]] && continue
+        
+        local SERVER_NAME="" SERVER_IP="" SERVER_PROXY="" LAST_TEST_DATE="" SERVER_DESCRIPTION=""
+        source "$profile"
+        echo -e "  • ${BOLD}${SERVER_NAME}${NC}"
+        echo "    IP: ${SERVER_IP}"
+        [[ -n "$SERVER_DESCRIPTION" ]] && echo "    Description: ${SERVER_DESCRIPTION}"
+        [[ -n "$SERVER_PROXY" ]] && echo "    Proxy: ${SERVER_PROXY}"
+        echo "    Last tested: ${LAST_TEST_DATE:-never}"
+        echo ""
+    done
+}
+
+add_server_to_session() {
+    local server_name="$1"
+    
+    for active in "${ACTIVE_SERVERS[@]}"; do
+        if [[ "$active" == "$server_name" ]]; then
+            log_warn "Server '$server_name' already in session"
+            return 0
+        fi
+    done
+    
+    ACTIVE_SERVERS+=("$server_name")
+    log_debug "Added $server_name to active session"
+}
+
+remove_server_from_session() {
+    local server_name="$1"
+    
+    if [[ "$server_name" == "localhost" ]]; then
+        log_warn "Cannot remove localhost from session"
+        return 1
+    fi
+    
+    local new_servers=()
+    for s in "${ACTIVE_SERVERS[@]}"; do
+        if [[ "$s" != "$server_name" ]]; then
+            new_servers+=("$s")
+        fi
+    done
+    ACTIVE_SERVERS=("${new_servers[@]}")
+    
+    unset "SERVER_STATUS[$server_name]"
+    log_success "Removed '$server_name' from session"
+}
+
+#==============================================================================
+# SERVER CONNECTION TESTING (V1.3)
+#==============================================================================
+
+test_server_connection() {
+    local server_name="$1"
+    
+    print_section "Testing Connection to: $server_name"
+    
+    if [[ "$server_name" == "localhost" ]]; then
+        SERVER_STATUS["localhost"]="connected"
+        log_success "localhost is always connected"
+        return 0
+    fi
+    
+    local ip="${SERVER_CONFIG[${server_name}.ip]}"
+    local user="${SERVER_CONFIG[${server_name}.user]}"
+    local proxy="${SERVER_CONFIG[${server_name}.proxy]:-}"
+    
+    if [[ -z "$ip" ]]; then
+        log_error "No IP configured for server '$server_name'"
+        return 1
+    fi
+    
+    local checks_passed=0
+    local checks_failed=0
+    
+    # Check 1: Resolve/ping
+    log_step "Checking host reachability..."
+    if ping -c 1 -W 3 "$ip" >/dev/null 2>&1; then
+        log_success "✓ Host reachable: $ip"
+        checks_passed=$((checks_passed + 1))
+    elif timeout 5 bash -c "echo >/dev/tcp/$ip/22" 2>/dev/null; then
+        log_success "✓ Host reachable (SSH port open, ping blocked)"
+        checks_passed=$((checks_passed + 1))
     else
-        ssh -o StrictHostKeyChecking=no "${SSH_USER}@${host}" "$command"
+        log_warn "⚠ Host not responding to ping or port 22 (may still work via proxy)"
+        checks_passed=$((checks_passed + 1))
+    fi
+    
+    # Check 2: SSH connectivity
+    log_step "Testing SSH connection..."
+    local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
+    
+    if [[ -n "$proxy" ]]; then
+        ssh_opts="$ssh_opts -J ${proxy}"
+        log_info "  Using ProxyJump: $proxy"
+    fi
+    
+    if ssh $ssh_opts "${user}@${ip}" "echo connected" >/dev/null 2>&1; then
+        log_success "✓ SSH connection successful"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_error "✗ SSH connection failed"
+        echo ""
+        echo "  Troubleshooting:"
+        echo "    1. Copy SSH key: ssh-copy-id ${user}@${ip}"
+        [[ -n "$proxy" ]] && echo "       Or: ssh-copy-id -o ProxyJump=${proxy} ${user}@${ip}"
+        echo "    2. Test manually: ssh ${ssh_opts} ${user}@${ip}"
+        echo ""
+        checks_failed=$((checks_failed + 1))
+        SERVER_STATUS["$server_name"]="connection_failed"
+        return 1
+    fi
+    
+    # Check 3: Sudo access
+    log_step "Testing sudo access..."
+    if ssh $ssh_opts "${user}@${ip}" "sudo -n true" >/dev/null 2>&1; then
+        log_success "✓ Passwordless sudo available"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_warn "⚠ Passwordless sudo not available (may need password entry)"
+        checks_passed=$((checks_passed + 1))
+    fi
+    
+    # Check 4: WP-CLI
+    log_step "Testing WP-CLI..."
+    local wp_version
+    wp_version=$(ssh $ssh_opts "${user}@${ip}" "wp --version 2>/dev/null" || echo "")
+    if [[ -n "$wp_version" ]]; then
+        log_success "✓ WP-CLI available: $wp_version"
+        checks_passed=$((checks_passed + 1))
+    else
+        log_warn "⚠ WP-CLI not found (some operations will be limited)"
+        checks_passed=$((checks_passed + 1))
+    fi
+    
+    # Check 5: WordPress sites
+    log_step "Scanning for WordPress installations..."
+    local site_count
+    site_count=$(ssh $ssh_opts "${user}@${ip}" "find /var/www -maxdepth 2 -name 'wp-config.php' 2>/dev/null | wc -l" || echo "0")
+    
+    if [[ $site_count -gt 0 ]]; then
+        log_success "✓ Found $site_count WordPress site(s)"
+        SERVER_CONFIG["${server_name}.sites_found"]="$site_count"
+    else
+        log_warn "⚠ No WordPress sites found in /var/www"
+    fi
+    checks_passed=$((checks_passed + 1))
+    
+    # Update profile if it exists
+    local profile_file="${PROFILE_DIR}/${server_name}.conf"
+    if [[ -f "$profile_file" ]]; then
+        sed -i "s/^LAST_TEST_DATE=.*/LAST_TEST_DATE=\"$(date '+%Y-%m-%d %H:%M:%S')\"/" "$profile_file" 2>/dev/null || true
+        sed -i "s/^LAST_TEST_STATUS=.*/LAST_TEST_STATUS=\"success\"/" "$profile_file" 2>/dev/null || true
+        sed -i "s/^SITES_FOUND=.*/SITES_FOUND=\"$site_count\"/" "$profile_file" 2>/dev/null || true
+    fi
+    
+    # Summary
+    echo ""
+    echo "Connection Test Summary: $checks_passed passed, $checks_failed failed"
+    echo ""
+    
+    if [[ $checks_failed -eq 0 ]]; then
+        SERVER_STATUS["$server_name"]="connected"
+        log_success "Server '$server_name' ready for operations"
+        return 0
+    else
+        SERVER_STATUS["$server_name"]="connection_issues"
+        log_error "Server '$server_name' has connection issues"
+        return 1
     fi
 }
 
+#==============================================================================
+# ENHANCED REMOTE EXECUTION WITH PROXYJUMP (V1.3)
+#==============================================================================
+
+remote_exec() {
+    local server="$1"
+    shift
+    local command="$*"
+    
+    # Local execution
+    if [[ "$server" == "localhost" ]] || [[ -z "$server" ]]; then
+        eval "$command"
+        return $?
+    fi
+    
+    # V1.3: Check if server is in multi-server session
+    local ip="${SERVER_CONFIG[${server}.ip]:-}"
+    local user="${SERVER_CONFIG[${server}.user]:-}"
+    local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
+    
+    if [[ -n "$ip" ]]; then
+        # Use session-based connection
+        local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=30"
+        [[ -n "$proxy" ]] && ssh_opts="$ssh_opts -J ${proxy}"
+        
+        log_debug "Executing on $server ($ip): $command"
+        ssh $ssh_opts "${user}@${ip}" "$command"
+        return $?
+    fi
+    
+    # Fallback: legacy behavior (direct hostname, uses global SSH_USER)
+    ssh -o StrictHostKeyChecking=no "${SSH_USER}@${server}" "$command"
+}
+
 remote_copy() {
-    local host="$1"
+    local server="$1"
     local src="$2"
     local dst="$3"
     local direction="${4:-to}"  # 'to' or 'from'
     
-    if [[ "$host" == "localhost" ]]; then
+    # Local copy
+    if [[ "$server" == "localhost" ]]; then
         cp -rp "$src" "$dst"
-    else
+        return $?
+    fi
+    
+    # V1.3: Check session config
+    local ip="${SERVER_CONFIG[${server}.ip]:-}"
+    local user="${SERVER_CONFIG[${server}.user]:-}"
+    local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
+    
+    local rsync_ssh_opts=""
+    if [[ -n "$proxy" ]]; then
+        rsync_ssh_opts="-e 'ssh -J ${proxy}'"
+    fi
+    
+    if [[ -n "$ip" ]]; then
+        # Session-based connection
         if [[ "$direction" == "to" ]]; then
-            rsync -avz --progress "$src" "${SSH_USER}@${host}:${dst}"
+            eval "rsync -avz --progress $rsync_ssh_opts \"$src\" \"${user}@${ip}:${dst}\""
         else
-            rsync -avz --progress "${SSH_USER}@${host}:${src}" "$dst"
+            eval "rsync -avz --progress $rsync_ssh_opts \"${user}@${ip}:${src}\" \"$dst\""
         fi
+        return $?
+    fi
+    
+    # Fallback: legacy behavior
+    if [[ "$direction" == "to" ]]; then
+        rsync -avz --progress "$src" "${SSH_USER}@${server}:${dst}"
+    else
+        rsync -avz --progress "${SSH_USER}@${server}:${src}" "$dst"
     fi
 }
 
@@ -965,18 +1284,18 @@ inventory_site() {
     config_data=$(parse_wp_config "$wp_config" "$host")
     
     # Extract values
-    local db_name db_user db_pass db_host table_prefix is_multisite_flag
+    # V1.3 FIX: parse_wp_config outputs UPPERCASE (DB_NAME, DB_USER, etc.)
     eval "$config_data"
     
     # Test DB connection
-    test_db_connection "$db_host" "$db_user" "$db_pass" "$db_name" "$host" || {
+    test_db_connection "$DB_HOST" "$DB_USER" "$DB_PASS" "$DB_NAME" "$host" || {
         log_warn "Database connection test failed, but continuing..."
     }
     
     # Detect if this is multisite and get blog context
     local multisite_status="No"
     local blog_id=""
-    local site_table_prefix="$table_prefix"
+    local site_table_prefix="$TABLE_PREFIX"
     
     if [[ "$is_multisite_flag" == "true" ]] || is_multisite "$wp_path" "$host"; then
         multisite_status="Yes"
@@ -1088,10 +1407,10 @@ inventory_site() {
    ${wp_path}
 
 4. DATABASE
-   Name:     $db_name
-   User:     $db_user
-   Host:     $db_host
-   $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "Password: $db_pass"; else echo "Password: [hidden - use --show-secrets]"; fi)
+   Name:     $DB_NAME
+   User:     $DB_USER
+   Host:     $DB_HOST
+   $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "Password: $DB_PASS"; else echo "Password: [hidden - use --show-secrets]"; fi)
 
 5. ENVIRONMENT
    ${environment} $(if [[ "$environment" == "test" ]]; then echo "(testing/staging)"; else echo "(production)"; fi)
@@ -1100,7 +1419,7 @@ inventory_site() {
    Multisite:     $multisite_status
    $(if [[ "$multisite_status" == "Yes" && -n "$blog_id" ]]; then echo "Blog ID:       $blog_id"; fi)
    Table Prefix:  $site_table_prefix
-   $(if [[ "$site_table_prefix" != "$table_prefix" ]]; then echo "Network Prefix: $table_prefix"; fi)
+   $(if [[ "$site_table_prefix" != "$TABLE_PREFIX" ]]; then echo "Network Prefix: $TABLE_PREFIX"; fi)
 
 7. UPLOADS CONFIGURATION
    Physical Path: $uploads_basedir
@@ -1148,7 +1467,7 @@ Generated: $(date)
 1. DOMAIN: $domain
 2. SERVER: $host
 3. WORDPRESS PATH: $wp_path
-4. DATABASE: $db_name (user: $db_user, host: $db_host)$(if [[ "$SHOW_SECRETS" == "true" ]]; then echo ", password: $db_pass"; fi)
+4. DATABASE: $DB_NAME (user: $DB_USER, host: $DB_HOST)$(if [[ "$SHOW_SECRETS" == "true" ]]; then echo ", password: $DB_PASS"; fi)
 5. ENVIRONMENT: $environment
 6. MULTISITE: $multisite_status$(if [[ -n "$blog_id" ]]; then echo " (blog_id: $blog_id, prefix: $site_table_prefix)"; fi)
 7. UPLOADS: $uploads_baseurl (physical: $uploads_basedir, uses sites/<id>: $uses_sites_structure)
@@ -1179,17 +1498,17 @@ EOF
     "2_server": "${host}",
     "3_wordpress_path": "${wp_path}",
     "4_database": {
-      "name": "${db_name}",
-      "user": "${db_user}",
-      "host": "${db_host}",
-      "password": $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "\"$db_pass\""; else echo "\"[redacted]\""; fi)
+      "name": "${DB_NAME}",
+      "user": "${DB_USER}",
+      "host": "${DB_HOST}",
+      "password": $(if [[ "$SHOW_SECRETS" == "true" ]]; then echo "\"$DB_PASS\""; else echo "\"[redacted]\""; fi)
     },
     "5_environment": "${environment}",
     "6_multisite_context": {
       "is_multisite": $(if [[ "$multisite_status" == "Yes" ]]; then echo "true"; else echo "false"; fi),
       "blog_id": $(if [[ -n "$blog_id" ]]; then echo "\"$blog_id\""; else echo "null"; fi),
       "site_table_prefix": "${site_table_prefix}",
-      "network_prefix": "${table_prefix}"
+      "network_prefix": "${TABLE_PREFIX}"
     },
     "7_uploads_config": {
       "basedir": "${uploads_basedir}",
@@ -1248,6 +1567,31 @@ create_backup() {
     
     validate_environment_match "$wp_path" "$DB_NAME" "$env" || return 1
     
+    # V1.3: Estimate backup size before proceeding
+    log_step "Estimating backup size..."
+    local est_files_mb=0
+    local est_db_mb=0
+    if [[ "$host" == "localhost" ]]; then
+        est_files_mb=$(du -sm "$wp_path" 2>/dev/null | cut -f1 || echo "0")
+        est_db_mb=$(mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -sN -e \
+            "SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';" 2>/dev/null || echo "0")
+    else
+        est_files_mb=$(remote_exec "$host" "du -sm $wp_path 2>/dev/null | cut -f1" 2>/dev/null || echo "0")
+        est_db_mb=$(remote_exec "$host" "mysql -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$DB_NAME\" -sN -e \"SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024) FROM information_schema.TABLES WHERE table_schema = '$DB_NAME';\"" 2>/dev/null || echo "0")
+    fi
+    est_files_mb="${est_files_mb:-0}"
+    est_db_mb="${est_db_mb:-0}"
+    local est_total_mb=$((est_files_mb + est_db_mb))
+    log_info "Estimated size: ~${est_total_mb}MB (files: ${est_files_mb}MB, database: ${est_db_mb}MB)"
+    
+    if [[ $est_total_mb -gt 1000 ]]; then
+        log_warn "Large backup (>1GB). This may take several minutes."
+        if ! confirm "Continue?" "y"; then
+            log_info "Backup cancelled"
+            return 0
+        fi
+    fi
+    
     # Create backup directory
     local backup_base="${BACKUP_ROOT}/${site_slug}/${env}"
     local backup_dir="${backup_base}/${RUN_TIMESTAMP}"
@@ -1260,12 +1604,13 @@ create_backup() {
     fi
     
     # Backup database
-    log_step "Backing up database: $db_name"
+    # V1.3 FIX: Use UPPERCASE variables from eval (DB_NAME, DB_USER, DB_PASS, DB_HOST)
+    log_step "Backing up database: $DB_NAME"
     local db_dump="$backup_dir/db.sql.gz"
-    local dump_cmd="mysqldump -h\"$db_host\" -u\"$db_user\" -p\"$db_pass\" --single-transaction --routines --triggers \"$db_name\" | gzip > \"$db_dump\""
+    local dump_cmd="mysqldump -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" --single-transaction --routines --triggers \"$DB_NAME\" | gzip > \"$db_dump\""
     
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would execute: $dump_cmd"
+        log_info "[DRY RUN] Would back up database: $DB_NAME"
     else
         if [[ "$host" == "localhost" ]]; then
             eval "$dump_cmd" || {
@@ -1278,7 +1623,23 @@ create_backup() {
                 return 1
             }
         fi
-        log_success "Database backed up"
+        
+        # V1.3: Verify backup file was created and is not empty
+        if [[ "$host" == "localhost" ]]; then
+            if [[ ! -f "$db_dump" ]] || [[ ! -s "$db_dump" ]]; then
+                log_error "Backup file is missing or empty: $db_dump"
+                return 1
+            fi
+            log_success "Database backed up ($(du -h "$db_dump" | cut -f1))"
+        else
+            local remote_size
+            remote_size=$(remote_exec "$host" "test -s $db_dump && du -h $db_dump | cut -f1 || echo EMPTY")
+            if [[ "$remote_size" == "EMPTY" ]]; then
+                log_error "Backup file is missing or empty on remote: $db_dump"
+                return 1
+            fi
+            log_success "Database backed up ($remote_size)"
+        fi
     fi
     
     # Backup uploads
@@ -1344,9 +1705,9 @@ create_backup() {
   "environment": "${env}",
   "host": "${host}",
   "wp_path": "${wp_path}",
-  "db_name": "${db_name}",
-  "db_host": "${db_host}",
-  "table_prefix": "${table_prefix}",
+  "db_name": "${DB_NAME}",
+  "db_host": "${DB_HOST}",
+  "table_prefix": "${TABLE_PREFIX}",
   "created_by": "webdev-migrate v${SCRIPT_VERSION}"
 }
 EOF
@@ -1432,6 +1793,31 @@ RESTORE_EOF
     echo ""
     
     log_success "Backup completed successfully"
+    
+    # V1.3: Automatic backup retention cleanup
+    if [[ "$BACKUP_RETENTION_DAYS" -gt 0 ]]; then
+        local old_count=0
+        if [[ "$host" == "localhost" ]]; then
+            old_count=$(find "$backup_base" -maxdepth 1 -type d -name "[0-9]*" -mtime "+${BACKUP_RETENTION_DAYS}" 2>/dev/null | wc -l)
+            if [[ $old_count -gt 0 ]]; then
+                log_step "Cleaning $old_count backup(s) older than ${BACKUP_RETENTION_DAYS} days..."
+                find "$backup_base" -maxdepth 1 -type d -name "[0-9]*" -mtime "+${BACKUP_RETENTION_DAYS}" -exec rm -rf {} \; 2>/dev/null || true
+            fi
+        else
+            old_count=$(remote_exec "$host" "find $backup_base -maxdepth 1 -type d -name '[0-9]*' -mtime +${BACKUP_RETENTION_DAYS} 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+            if [[ "$old_count" -gt 0 ]]; then
+                log_step "Cleaning $old_count backup(s) older than ${BACKUP_RETENTION_DAYS} days..."
+                remote_exec "$host" "find $backup_base -maxdepth 1 -type d -name '[0-9]*' -mtime +${BACKUP_RETENTION_DAYS} -exec rm -rf {} \\; 2>/dev/null" || true
+            fi
+        fi
+        local remaining
+        if [[ "$host" == "localhost" ]]; then
+            remaining=$(find "$backup_base" -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | wc -l)
+        else
+            remaining=$(remote_exec "$host" "find $backup_base -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | wc -l" 2>/dev/null || echo "?")
+        fi
+        log_info "Backups for $site_slug/$env: $remaining kept (retention: ${BACKUP_RETENTION_DAYS} days)"
+    fi
     
     return 0
 }
@@ -1545,12 +1931,13 @@ restore_backup() {
     fi
     
     # Get DB credentials (either from parameter or from wp-config backup)
-    local db_user db_pass db_host
+    # V1.3 FIX: Use consistent uppercase variable names after credential resolution
     if [[ -n "$target_db_name" ]]; then
-        read -r -p "Enter database user: " db_user
-        # V1.2.1: Use password helper
-        get_db_password_with_help "$target_wp_path" "db_pass"
-        db_host="localhost"
+        echo -e "${CYAN}Tip: Database user is usually in wp-config.php — check option S or the backup's wp-config.php${NC}"
+        read -r -p "Enter database user: " DB_USER
+        # V1.2.1: Use password helper (auto-extract from wp-config if available)
+        get_db_password_with_help "$target_wp_path" "DB_PASS"
+        DB_HOST="localhost"
     else
         # Try to read from wp-config backup
         local wp_config_backup="$backup_dir/wp-config.php"
@@ -1560,9 +1947,22 @@ restore_backup() {
                 config_data=$(parse_wp_config "$wp_config_backup" "localhost")
                 eval "$config_data"
                 target_db_name="$DB_NAME"
-                db_user="$DB_USER"
-                db_pass="$DB_PASS"
-                db_host="${DB_HOST:-localhost}"
+                # DB_USER, DB_PASS, DB_HOST are now set from eval
+                DB_HOST="${DB_HOST:-localhost}"
+            else
+                log_error "No wp-config.php in backup and no target DB specified"
+                return 1
+            fi
+        else
+            local remote_wp_config
+            remote_wp_config=$(remote_exec "$host" "cat $wp_config_backup 2>/dev/null" || echo "")
+            if [[ -n "$remote_wp_config" ]]; then
+                # Parse remotely by fetching content
+                local config_data
+                config_data=$(parse_wp_config "$wp_config_backup" "$host")
+                eval "$config_data"
+                target_db_name="$DB_NAME"
+                DB_HOST="${DB_HOST:-localhost}"
             else
                 log_error "No wp-config.php in backup and no target DB specified"
                 return 1
@@ -1574,23 +1974,23 @@ restore_backup() {
     log_step "Creating database: $target_db_name"
     if [[ "$host" == "localhost" ]]; then
         sudo mysql -e "CREATE DATABASE IF NOT EXISTS $target_db_name;" || log_warn "Database might already exist"
-        sudo mysql -e "GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass';" || true
+        sudo mysql -e "GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';" || true
         sudo mysql -e "FLUSH PRIVILEGES;" || true
     else
         remote_exec "$host" "sudo mysql -e 'CREATE DATABASE IF NOT EXISTS $target_db_name;'" || log_warn "Database might already exist"
-        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$db_user'@'localhost' IDENTIFIED BY '$db_pass';\"" || true
+        remote_exec "$host" "sudo mysql -e \"GRANT ALL PRIVILEGES ON ${target_db_name}.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';\"" || true
         remote_exec "$host" "sudo mysql -e 'FLUSH PRIVILEGES;'" || true
     fi
     
     # Import database
     log_step "Importing database dump"
     if [[ "$host" == "localhost" ]]; then
-        gunzip -c "$db_dump" | mysql -u"$db_user" -p"$db_pass" "$target_db_name" || {
+        gunzip -c "$db_dump" | mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$target_db_name" || {
             log_error "Database import failed"
             return 1
         }
     else
-        remote_exec "$host" "gunzip -c $db_dump | mysql -u\"$db_user\" -p\"$db_pass\" \"$target_db_name\"" || {
+        remote_exec "$host" "gunzip -c $db_dump | mysql -h \"$DB_HOST\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$target_db_name\"" || {
             log_error "Database import failed"
             return 1
         }
@@ -1968,9 +2368,6 @@ clone_live_to_test() {
     
     # V1.2: Validate live environment
     validate_environment_match "$live_wp_path" "$DB_NAME" "live" || return 1
-    local config_data
-    config_data=$(parse_wp_config "$live_wp_path/wp-config.php" "$host")
-    eval "$config_data"
     
     local live_db="$DB_NAME"
     local test_db="wp_testing_${site_slug}"
@@ -2129,6 +2526,7 @@ promote_test_to_live() {
     local live_db="$DB_NAME"
     local live_db_user="$DB_USER"
     local live_db_pass="$DB_PASS"
+    local live_db_host="${DB_HOST:-localhost}"
     
     eval "$test_config"
     local test_db="$DB_NAME"
@@ -2145,22 +2543,35 @@ promote_test_to_live() {
         return 1
     }
     
-    # Step 2: Backup live database to temp
+    # Step 2: Dump test database
     log_step "Dumping test database"
     local temp_dump="/tmp/test-db-${RUN_TIMESTAMP}.sql"
     if [[ "$host" == "localhost" ]]; then
-        mysqldump "$test_db" > "$temp_dump"
+        # V1.3 FIX: Use credentials from parsed configs
+        mysqldump -h "${DB_HOST:-localhost}" -u "$DB_USER" -p"$DB_PASS" "$test_db" > "$temp_dump" || {
+            log_error "Failed to dump test database"
+            return 1
+        }
     else
-        remote_exec "$host" "mysqldump $test_db > $temp_dump"
+        remote_exec "$host" "mysqldump -h \"${DB_HOST:-localhost}\" -u \"$DB_USER\" -p\"$DB_PASS\" \"$test_db\" > $temp_dump" || {
+            log_error "Failed to dump test database"
+            return 1
+        }
     fi
     
     # Step 3: Import to live database
     log_step "Importing test data to live database"
     if [[ "$host" == "localhost" ]]; then
-        mysql "$live_db" < "$temp_dump"
+        mysql -h "$live_db_host" -u "$live_db_user" -p"$live_db_pass" "$live_db" < "$temp_dump" || {
+            log_error "Failed to import to live database"
+            return 1
+        }
         rm "$temp_dump"
     else
-        remote_exec "$host" "mysql $live_db < $temp_dump && rm $temp_dump"
+        remote_exec "$host" "mysql -h \"$live_db_host\" -u \"$live_db_user\" -p\"$live_db_pass\" \"$live_db\" < $temp_dump && rm $temp_dump" || {
+            log_error "Failed to import to live database"
+            return 1
+        }
     fi
     
     # Step 4: Sync files
@@ -2296,6 +2707,7 @@ promote_subsite_to_standalone() {
     local ms_db="$DB_NAME"
     local ms_db_user="$DB_USER"
     local ms_db_pass="$DB_PASS"
+    local ms_db_host="${DB_HOST:-localhost}"
     local ms_table_prefix="$TABLE_PREFIX"
     
     # Step 1: Backup multisite
@@ -2341,7 +2753,8 @@ promote_subsite_to_standalone() {
     
     if [[ "$host" == "localhost" ]]; then
         # Export blog-specific tables
-        local tables=$(mysql -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" -e "SHOW TABLES LIKE '${blog_prefix}%'" | tail -n +2 | tr '\n' ' ')
+        # V1.3 FIX: Add -h flag, proper spacing
+        local tables=$(mysql -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" -e "SHOW TABLES LIKE '${blog_prefix}%'" | tail -n +2 | tr '\n' ' ')
         
         if [[ -z "$tables" ]]; then
             log_error "No tables found for blog_id: $blog_id"
@@ -2351,14 +2764,14 @@ promote_subsite_to_standalone() {
         log_info "Found tables: $tables"
         
         # Dump tables
-        mysqldump -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" $tables > "$temp_sql"
+        mysqldump -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" $tables > "$temp_sql"
         
         # Also export users and usermeta
-        mysqldump -u"$ms_db_user" -p"$ms_db_pass" "$ms_db" "${ms_table_prefix}users" "${ms_table_prefix}usermeta" >> "$temp_sql"
+        mysqldump -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$ms_db" "${ms_table_prefix}users" "${ms_table_prefix}usermeta" >> "$temp_sql"
         
         # Import to new database with prefix conversion
         log_step "Importing and converting table prefixes"
-        sed "s/${blog_prefix}/wp_/g" "$temp_sql" | sed "s/${ms_table_prefix}users/wp_users/g" | sed "s/${ms_table_prefix}usermeta/wp_usermeta/g" | mysql -u"$ms_db_user" -p"$ms_db_pass" "$target_db"
+        sed "s/${blog_prefix}/wp_/g" "$temp_sql" | sed "s/${ms_table_prefix}users/wp_users/g" | sed "s/${ms_table_prefix}usermeta/wp_usermeta/g" | mysql -h "$ms_db_host" -u "$ms_db_user" -p"$ms_db_pass" "$target_db"
         
         rm "$temp_sql"
     else
@@ -2398,7 +2811,7 @@ promote_subsite_to_standalone() {
 define('DB_NAME', '$target_db');
 define('DB_USER', '$ms_db_user');
 define('DB_PASSWORD', '$ms_db_pass');
-define('DB_HOST', 'localhost');
+define('DB_HOST', '$ms_db_host');
 define('DB_CHARSET', 'utf8mb4');
 define('DB_COLLATE', '');
 
@@ -3200,7 +3613,6 @@ list_all_sites() {
     echo ""
     
     return 0
-    set -e  # Re-enable strict error checking
 }
 
 #==============================================================================
@@ -3357,6 +3769,623 @@ show_startup_tips() {
 }
 
 #==============================================================================
+# MULTI-SERVER OPERATIONS (V1.3)
+#==============================================================================
+
+list_all_sites_multi() {
+    print_header "SITES ACROSS ALL SERVERS"
+    
+    echo "Active servers: ${ACTIVE_SERVERS[*]}"
+    echo ""
+    
+    local total_sites=0
+    local total_standalone=0
+    local total_multisite=0
+    
+    for server in "${ACTIVE_SERVERS[@]}"; do
+        local status="${SERVER_STATUS[$server]:-unknown}"
+        
+        echo "┌── ${server} $(if [[ "$status" == "connected" ]]; then echo "(✓ connected)"; else echo "(? $status)"; fi) ───────────────────────────────────┐"
+        echo ""
+        
+        if [[ "$status" != "connected" && "$server" != "localhost" ]]; then
+            echo "  (not connected - use 'T' to test connection first)"
+            echo ""
+            echo "└────────────────────────────────────────────────────────────────────┘"
+            echo ""
+            continue
+        fi
+        
+        local site_count=0
+        local wp_dirs=()
+        while IFS= read -r dir; do
+            [[ -n "$dir" ]] && wp_dirs+=("$dir")
+        done < <(remote_exec "$server" "find /var/www -maxdepth 2 -name 'wp-config.php' -exec dirname {} \\; 2>/dev/null | sort" 2>/dev/null)
+        
+        for wp_path in "${wp_dirs[@]}"; do
+            [[ -z "$wp_path" ]] && continue
+            site_count=$((site_count + 1))
+            total_sites=$((total_sites + 1))
+            
+            local domain
+            domain=$(remote_exec "$server" "sudo -u www-data wp --path=\"$wp_path\" option get siteurl 2>/dev/null | sed 's|https\\?://||' | sed 's|/.*||'" 2>/dev/null || echo "")
+            [[ -z "$domain" ]] && domain="[dir: $(basename "$wp_path")]"
+            
+            if remote_exec "$server" "sudo -u www-data wp --path=\"$wp_path\" core is-installed --network 2>/dev/null" 2>/dev/null; then
+                total_multisite=$((total_multisite + 1))
+                echo "  🟡 $domain [MULTISITE]"
+            else
+                total_standalone=$((total_standalone + 1))
+                echo "  🟢 $domain [STANDALONE]"
+            fi
+            echo "     $wp_path"
+            echo ""
+        done
+        
+        if [[ $site_count -eq 0 ]]; then
+            echo "  (no WordPress sites found)"
+            echo ""
+        fi
+        
+        echo "└────────────────────────────────────────────────────────────────────┘"
+        echo ""
+    done
+    
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Summary across all servers:"
+    echo "  Total sites:  $total_sites"
+    echo "  Standalone:   $total_standalone (🟢)"
+    echo "  Multisite:    $total_multisite (🟡)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+migrate_wizard_multi() {
+    print_header "CROSS-SERVER MIGRATION WIZARD"
+    
+    if [[ ${#ACTIVE_SERVERS[@]} -lt 2 ]]; then
+        log_error "Cross-server migration requires at least 2 servers in session"
+        log_info "Current servers: ${ACTIVE_SERVERS[*]}"
+        log_info "Add more servers with option A first"
+        return 1
+    fi
+    
+    # Step 1: Select source
+    print_section "Step 1: Select Source Server"
+    
+    local i=1
+    for server in "${ACTIVE_SERVERS[@]}"; do
+        local status="${SERVER_STATUS[$server]:-unknown}"
+        echo "  $i) $server ($status)"
+        i=$((i + 1))
+    done
+    echo ""
+    
+    local src_server_num
+    read -r -p "Select source server (number): " src_server_num
+    local src_idx=$((src_server_num - 1))
+    if [[ $src_idx -lt 0 || $src_idx -ge ${#ACTIVE_SERVERS[@]} ]]; then
+        log_error "Invalid selection"
+        return 1
+    fi
+    local src_server="${ACTIVE_SERVERS[$src_idx]}"
+    log_info "Source server: $src_server"
+    
+    # Get sites from source
+    echo ""
+    echo "Scanning sites on $src_server..."
+    local sites=()
+    while IFS= read -r dir; do
+        [[ -n "$dir" ]] && sites+=("$dir")
+    done < <(remote_exec "$src_server" "find /var/www -maxdepth 2 -name 'wp-config.php' -exec dirname {} \\; 2>/dev/null | sort" 2>/dev/null)
+    
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        log_error "No WordPress sites found on $src_server"
+        return 1
+    fi
+    
+    echo ""
+    echo "Available sites on $src_server:"
+    i=1
+    for site in "${sites[@]}"; do
+        local domain
+        domain=$(remote_exec "$src_server" "sudo -u www-data wp --path=\"$site\" option get siteurl 2>/dev/null | sed 's|https\\?://||'" 2>/dev/null || basename "$site")
+        echo "  $i) $domain ($site)"
+        i=$((i + 1))
+    done
+    echo ""
+    
+    local src_site_num
+    read -r -p "Select source site (number): " src_site_num
+    local site_idx=$((src_site_num - 1))
+    if [[ $site_idx -lt 0 || $site_idx -ge ${#sites[@]} ]]; then
+        log_error "Invalid selection"
+        return 1
+    fi
+    local src_wp_path="${sites[$site_idx]}"
+    local src_domain
+    src_domain=$(remote_exec "$src_server" "sudo -u www-data wp --path=\"$src_wp_path\" option get siteurl 2>/dev/null | sed 's|https\\?://||'" 2>/dev/null || basename "$src_wp_path")
+    
+    log_success "Source: $src_server:$src_domain ($src_wp_path)"
+    
+    # Step 2: Select destination
+    print_section "Step 2: Select Destination Server"
+    
+    echo "Available servers (excluding $src_server):"
+    i=1
+    local dst_options=()
+    for server in "${ACTIVE_SERVERS[@]}"; do
+        if [[ "$server" != "$src_server" ]]; then
+            dst_options+=("$server")
+            local status="${SERVER_STATUS[$server]:-unknown}"
+            echo "  $i) $server ($status)"
+            i=$((i + 1))
+        fi
+    done
+    echo ""
+    
+    local dst_server_num
+    read -r -p "Select destination server (number): " dst_server_num
+    local dst_idx=$((dst_server_num - 1))
+    if [[ $dst_idx -lt 0 || $dst_idx -ge ${#dst_options[@]} ]]; then
+        log_error "Invalid selection"
+        return 1
+    fi
+    local dst_server="${dst_options[$dst_idx]}"
+    
+    log_info "Destination server: $dst_server"
+    
+    local dst_domain
+    read -r -p "Domain for migrated site [$src_domain]: " dst_domain
+    dst_domain="${dst_domain:-$src_domain}"
+    
+    local site_slug
+    site_slug=$(echo "$dst_domain" | sed 's/\..*$//')
+    local dst_wp_path="/var/www/wordpress-${site_slug}"
+    
+    read -r -p "WordPress path on destination [$dst_wp_path]: " user_dst_path
+    dst_wp_path="${user_dst_path:-$dst_wp_path}"
+    
+    log_success "Destination: $dst_server:$dst_domain ($dst_wp_path)"
+    
+    # Step 3: Pre-flight checks
+    print_section "Step 3: Pre-Flight Checks"
+    
+    echo "[$src_server] Checking source..."
+    if ! remote_exec "$src_server" "test -d $src_wp_path" 2>/dev/null; then
+        log_error "Source path not found: $src_wp_path"
+        return 1
+    fi
+    log_success "✓ Source path exists"
+    
+    local src_size
+    src_size=$(remote_exec "$src_server" "du -sh $src_wp_path 2>/dev/null | cut -f1" 2>/dev/null || echo "unknown")
+    log_info "  Source size: $src_size"
+    
+    echo ""
+    echo "[$dst_server] Checking destination..."
+    
+    local dst_free
+    dst_free=$(remote_exec "$dst_server" "df -BG /var/www 2>/dev/null | awk 'NR==2 {print \$4}' | sed 's/G//'" 2>/dev/null || echo "0")
+    log_info "  Free space: ${dst_free}GB"
+    
+    if [[ "$dst_free" =~ ^[0-9]+$ ]] && [[ $dst_free -lt 5 ]]; then
+        log_error "Insufficient disk space on destination (<5GB free)"
+        return 1
+    fi
+    log_success "✓ Sufficient disk space"
+    
+    if remote_exec "$dst_server" "test -d $dst_wp_path" 2>/dev/null; then
+        log_warn "⚠ Destination path already exists: $dst_wp_path"
+        if ! confirm "Overwrite existing installation?" "n"; then
+            log_info "Migration cancelled"
+            return 1
+        fi
+    fi
+    
+    # Step 4: Migration plan
+    print_section "Step 4: Migration Plan"
+    
+    echo ""
+    echo "This will:"
+    echo "  1. Create backup on $src_server"
+    echo "  2. Transfer backup: $src_server → $dst_server"
+    echo "  3. Restore on $dst_server"
+    echo "  4. Update URLs: $src_domain → $dst_domain"
+    echo "  5. Verify migration"
+    echo ""
+    echo "Source: $src_server:$src_domain"
+    echo "Destination: $dst_server:$dst_domain"
+    echo "Size: $src_size"
+    echo ""
+    
+    # Safety: confirmation
+    if ! require_confirmation_string "MIGRATE" \
+        "This will perform a cross-server migration."; then
+        log_info "Migration cancelled"
+        return 1
+    fi
+    
+    # V1.3 SAFETY: Dry-run validation
+    print_section "Step 5: Pre-Migration Validation (Dry Run)"
+    
+    local validation_ok=true
+    
+    log_step "Validating source WordPress installation..."
+    if remote_exec "$src_server" "sudo -u www-data wp --path=\"$src_wp_path\" core version 2>/dev/null" 2>/dev/null; then
+        log_success "✓ Source WordPress responding"
+    else
+        log_error "✗ Source WordPress not responding (WP-CLI check failed)"
+        validation_ok=false
+    fi
+    
+    log_step "Validating source database..."
+    if remote_exec "$src_server" "sudo -u www-data wp --path=\"$src_wp_path\" db check 2>/dev/null" 2>/dev/null; then
+        log_success "✓ Source database healthy"
+    else
+        log_warn "⚠ Source database check had warnings (may be OK)"
+    fi
+    
+    log_step "Validating destination write access..."
+    if remote_exec "$dst_server" "sudo mkdir -p /srv/backups/wp/test-write-$$  && sudo rmdir /srv/backups/wp/test-write-$$" 2>/dev/null; then
+        log_success "✓ Destination is writable"
+    else
+        log_error "✗ Cannot write to destination server"
+        validation_ok=false
+    fi
+    
+    if [[ "$validation_ok" == "false" ]]; then
+        log_error "Pre-migration validation FAILED. Fix issues above before retrying."
+        return 1
+    fi
+    
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  VALIDATION PASSED — Ready to migrate"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    
+    # V1.3 SAFETY: Optional rollback backup of destination
+    if remote_exec "$dst_server" "test -d $dst_wp_path" 2>/dev/null; then
+        local create_rollback
+        read -r -p "Destination exists. Create rollback backup before overwriting? (Y/n): " create_rollback
+        create_rollback="${create_rollback:-y}"
+        
+        if [[ "$create_rollback" == "y" || "$create_rollback" == "Y" ]]; then
+            local dst_slug
+            dst_slug=$(echo "$dst_domain" | sed 's/\..*$//')
+            log_step "Creating rollback backup of existing destination..."
+            if create_backup "$dst_wp_path" "${dst_slug}-rollback" "pre-migration" "$dst_server"; then
+                log_success "Rollback backup created"
+                log_info "  To rollback: restore from /srv/backups/wp/${dst_slug}-rollback/pre-migration/"
+            else
+                log_warn "Could not create rollback backup"
+                if ! confirm "Continue without rollback backup?" "n"; then
+                    log_info "Migration cancelled"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+    
+    # Step 6: Execute
+    print_section "Step 6: Executing Migration"
+    
+    # Create source backup
+    log_step "[1/5] Creating backup on $src_server..."
+    if ! create_backup "$src_wp_path" "$site_slug" "migration-source" "$src_server"; then
+        log_error "Backup failed on source server"
+        return 1
+    fi
+    
+    local src_backup_dir
+    src_backup_dir=$(remote_exec "$src_server" "ls -td /srv/backups/wp/$site_slug/migration-source/[0-9]* 2>/dev/null | head -n 1" 2>/dev/null)
+    
+    if [[ -z "$src_backup_dir" ]]; then
+        log_error "Could not find backup directory on source"
+        return 1
+    fi
+    log_info "Source backup: $src_backup_dir"
+    
+    # Transfer backup
+    log_step "[2/5] Transferring backup: $src_server → $dst_server..."
+    local dst_backup_dir="/srv/backups/wp/$site_slug/migration-dest/$RUN_TIMESTAMP"
+    
+    remote_exec "$dst_server" "mkdir -p $dst_backup_dir" 2>/dev/null
+    
+    local temp_dir="/tmp/webdev-migrate-transfer-${RUN_TIMESTAMP}"
+    # V1.3: Ensure cleanup even on failure
+    trap "rm -rf '$temp_dir' 2>/dev/null || true" RETURN
+    mkdir -p "$temp_dir"
+    
+    log_info "  Downloading from $src_server..."
+    remote_copy "$src_server" "$src_backup_dir/" "$temp_dir/" "from"
+    
+    log_info "  Uploading to $dst_server..."
+    remote_copy "$dst_server" "$temp_dir/" "$dst_backup_dir/" "to"
+    
+    rm -rf "$temp_dir"
+    log_success "Transfer complete"
+    
+    # Restore on destination
+    log_step "[3/5] Restoring on $dst_server..."
+    if ! restore_backup "$dst_backup_dir" "$dst_wp_path" "" "$dst_server"; then
+        log_error "Restore failed on destination"
+        return 1
+    fi
+    
+    # Update URLs
+    log_step "[4/5] Updating URLs..."
+    local src_url="https://$src_domain"
+    local dst_url="https://$dst_domain"
+    
+    if [[ "$src_domain" != "$dst_domain" ]]; then
+        remote_exec "$dst_server" "sudo -u www-data wp --path=\"$dst_wp_path\" search-replace \"$src_url\" \"$dst_url\" --all-tables --report-changed-only" 2>/dev/null || log_warn "URL replacement had warnings"
+        log_success "URLs updated"
+    else
+        log_info "Same domain - no URL replacement needed"
+    fi
+    
+    # Verify
+    log_step "[5/5] Verifying migration..."
+    local dst_siteurl
+    dst_siteurl=$(remote_exec "$dst_server" "sudo -u www-data wp --path=\"$dst_wp_path\" option get siteurl 2>/dev/null" 2>/dev/null || echo "")
+    
+    if [[ -n "$dst_siteurl" ]]; then
+        log_success "✓ WordPress responding on destination"
+        log_info "  Site URL: $dst_siteurl"
+    else
+        log_warn "⚠ Could not verify WordPress on destination (may need manual check)"
+    fi
+    
+    log_success "Migration complete!"
+    
+    print_section "Post-Migration Tasks"
+    echo ""
+    echo "✅ Migration: $src_server:$src_domain → $dst_server:$dst_domain"
+    echo ""
+    echo "Next steps:"
+    echo "  □ Configure Apache vhost on $dst_server for $dst_domain"
+    echo "  □ Test the site: $dst_url"
+    echo "  □ Update DNS if needed"
+    echo "  □ Run health check on destination"
+    echo ""
+    echo "Original site on $src_server:"
+    echo "  Still exists at: $src_wp_path"
+    echo "  Backup: $src_backup_dir"
+    echo ""
+    
+    return 0
+}
+
+setup_server_wizard() {
+    print_header "ADD SERVER TO SESSION"
+    
+    list_saved_profiles
+    
+    echo "Options:"
+    echo "  1) Load saved profile"
+    echo "  2) Manual setup (create new profile)"
+    echo ""
+    
+    local setup_choice
+    read -r -p "Choice: " setup_choice
+    
+    case "$setup_choice" in
+        1)
+            local profile_name
+            read -r -p "Enter profile name to load: " profile_name
+            local server_name
+            server_name=$(load_server_profile "$profile_name") || return 1
+            
+            if [[ -n "$server_name" ]]; then
+                if test_server_connection "$server_name"; then
+                    add_server_to_session "$server_name"
+                    log_success "Server '$server_name' added to session"
+                else
+                    if confirm "Add to session anyway (connection failed)?" "n"; then
+                        add_server_to_session "$server_name"
+                    fi
+                fi
+            fi
+            ;;
+        2)
+            echo ""
+            echo "Manual Server Setup"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            
+            local server_name server_ip server_user
+            read -r -p "Short name for this server (e.g., 'web'): " server_name
+            
+            # V1.3: Validate server name
+            if [[ -z "$server_name" ]]; then
+                log_error "Server name cannot be empty"
+                return 1
+            fi
+            
+            if [[ "$server_name" =~ [^a-zA-Z0-9_-] ]]; then
+                log_error "Server name can only contain letters, numbers, dash, underscore"
+                return 1
+            fi
+            
+            if [[ "$server_name" == "localhost" ]]; then
+                log_error "Name 'localhost' is reserved"
+                return 1
+            fi
+            
+            # Check for duplicate
+            for existing in "${ACTIVE_SERVERS[@]}"; do
+                if [[ "$existing" == "$server_name" ]]; then
+                    log_error "Server '$server_name' already in session"
+                    return 1
+                fi
+            done
+            
+            echo ""
+            echo -e "💡 ${CYAN}To find the IP on the target server, run: hostname -I${NC}"
+            read -r -p "Server hostname or IP: " server_ip
+            
+            read -r -p "SSH username [$USER]: " server_user
+            server_user="${server_user:-$USER}"
+            
+            echo ""
+            local needs_proxy proxy_host=""
+            read -r -p "Does this require ProxyJump/jumphost? (y/N): " needs_proxy
+            
+            if [[ "$needs_proxy" == "y" || "$needs_proxy" == "Y" ]]; then
+                echo -e "💡 ${CYAN}ProxyJump format: user@jumphost or just jumphost${NC}"
+                read -r -p "ProxyJump hostname (e.g., jumphost.cs.earlham.edu): " proxy_host
+            fi
+            
+            local description
+            read -r -p "Description (optional): " description
+            
+            # Add to session
+            SERVER_CONFIG["${server_name}.ip"]="$server_ip"
+            SERVER_CONFIG["${server_name}.user"]="$server_user"
+            SERVER_CONFIG["${server_name}.proxy"]="$proxy_host"
+            SERVER_CONFIG["${server_name}.description"]="$description"
+            
+            # Save profile
+            local save_profile
+            read -r -p "Save as profile for future use? (Y/n): " save_profile
+            save_profile="${save_profile:-y}"
+            
+            if [[ "$save_profile" == "y" || "$save_profile" == "Y" ]]; then
+                save_server_profile "$server_name" "$server_ip" "$server_user" "$proxy_host" "$description"
+            fi
+            
+            # Test connection
+            echo ""
+            if test_server_connection "$server_name"; then
+                add_server_to_session "$server_name"
+                log_success "Server '$server_name' added to session and ready!"
+            else
+                if confirm "Add to session anyway (connection had issues)?" "n"; then
+                    add_server_to_session "$server_name"
+                fi
+            fi
+            ;;
+        *)
+            log_error "Invalid choice"
+            ;;
+    esac
+}
+
+#==============================================================================
+# MULTI-SERVER MENU (V1.3)
+#==============================================================================
+
+show_multi_server_menu() {
+    clear
+    cat <<EOF
+╔══════════════════════════════════════════════════════════════════╗
+║                   MULTI-SERVER MODE                              ║
+╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+    
+    echo "Active servers: ${ACTIVE_SERVERS[*]}"
+    echo ""
+    
+    # Show status of each server
+    for server in "${ACTIVE_SERVERS[@]}"; do
+        local status="${SERVER_STATUS[$server]:-unknown}"
+        local desc="${SERVER_CONFIG[${server}.description]:-}"
+        if [[ "$status" == "connected" ]]; then
+            echo -e "  ${GREEN}✓${NC} $server $(if [[ -n "$desc" ]]; then echo "($desc)"; fi)"
+        else
+            echo -e "  ${YELLOW}?${NC} $server ($status)"
+        fi
+    done
+    
+    echo ""
+    echo -e "  ${BOLD}── SERVER MANAGEMENT ──${NC}"
+    echo "  A) Add server to session"
+    echo "  D) Remove server from session"
+    echo "  T) Test server connection"
+    echo "  P) View saved profiles"
+    echo ""
+    echo -e "  ${BOLD}── OPERATIONS ──${NC}"
+    echo "  1) View all sites across all servers"
+    echo "  2) Migrate site (server → server)"
+    echo "  3) Inventory a site on remote server"
+    echo "  4) Health check on remote server"
+    echo ""
+    echo "  B) Back to main menu"
+    echo "  0) Exit"
+    echo ""
+}
+
+run_multi_server_menu() {
+    # Initialize session if not already done
+    if [[ ${#ACTIVE_SERVERS[@]} -eq 0 ]]; then
+        init_multi_server_session
+    fi
+    
+    while true; do
+        show_multi_server_menu
+        local choice
+        read -r -p "Choice: " choice
+        echo ""
+        
+        case "$choice" in
+            [aA])
+                setup_server_wizard
+                ;;
+            [dD])
+                echo "Active servers: ${ACTIVE_SERVERS[*]}"
+                local server_name
+                read -r -p "Server to remove: " server_name
+                remove_server_from_session "$server_name"
+                ;;
+            [tT])
+                echo "Active servers: ${ACTIVE_SERVERS[*]}"
+                local server_name
+                read -r -p "Server to test: " server_name
+                test_server_connection "$server_name"
+                ;;
+            [pP])
+                list_saved_profiles
+                ;;
+            1)
+                list_all_sites_multi
+                ;;
+            2)
+                migrate_wizard_multi
+                ;;
+            3)
+                echo "Active servers: ${ACTIVE_SERVERS[*]}"
+                local server_name domain
+                read -r -p "Server: " server_name
+                read -r -p "Domain: " domain
+                inventory_site "$domain" "" "$server_name"
+                ;;
+            4)
+                echo "Active servers: ${ACTIVE_SERVERS[*]}"
+                local server_name domain
+                read -r -p "Server: " server_name
+                read -r -p "Domain: " domain
+                healthcheck_site "$domain" "" "$server_name"
+                ;;
+            [bB])
+                return 0
+                ;;
+            0)
+                echo "Exiting..."
+                exit 0
+                ;;
+            *)
+                log_error "Invalid choice"
+                ;;
+        esac
+        
+        echo ""
+        read -r -p "Press Enter to continue..."
+    done
+}
+
+#==============================================================================
 # MAIN MENU
 #==============================================================================
 
@@ -3373,6 +4402,34 @@ show_menu() {
 ║                                                                  ║
 ║                 Made with Coffee by Nour Al-Sheikh               ║
 ║                                                                  ║
+╚══════════════════════════════════════════════════════════════════╝
+
+EOF
+    
+    echo "SCOPE SELECTION:"
+    echo ""
+    echo -e "  ${BOLD}L)${NC}  Local Server Operations"
+    echo "      Work on THIS server only (traditional mode)"
+    echo ""
+    echo -e "  ${BOLD}M)${NC}  Multi-Server Mode ${CYAN}[NEW in v1.3]${NC}"
+    echo "      Manage multiple servers, cross-server migrations"
+    echo ""
+    echo -e "  ${BOLD}── QUICK ACCESS ──${NC}"
+    echo "  S)  List sites (local server)"
+    echo "  R)  Quick Reference"
+    echo ""
+    echo "  0)  Exit"
+    echo ""
+    echo -e "  💡 ${CYAN}TIP:${NC} Most users should start with 'S' to see what's on this server"
+    echo -e "  📋 Use 'M' for cross-server migrations (requires SSH setup)"
+    echo ""
+}
+
+show_local_menu() {
+    clear
+    cat <<EOF
+╔══════════════════════════════════════════════════════════════════╗
+║         LOCAL SERVER OPERATIONS - v${SCRIPT_VERSION}                         ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 EOF
@@ -3395,6 +4452,7 @@ EOF
     echo "  9)  Health check / troubleshooting"
     echo "  10) URL audit and fix (use for deep plugin scan)"
     echo ""
+    echo "  B)  Back to main menu"
     echo "  0)  Exit"
     echo ""
     echo -e "  💡 ${CYAN}TIP:${NC} Open a second terminal to look things up!"
@@ -3410,10 +4468,59 @@ run_interactive_menu() {
     # V1.2.1: Show startup tips on first run
     show_startup_tips
     
+    # V1.3: Two-tier menu system
     while true; do
         show_menu
-        read -r -p "Choice: " choice
+        local scope_choice
+        read -r -p "Choice: " scope_choice
         echo ""
+        
+        case "$scope_choice" in
+            [lL])
+                run_local_menu
+                ;;
+            [mM])
+                run_multi_server_menu
+                ;;
+            [sS])
+                list_all_sites
+                echo ""
+                read -r -p "Press Enter to continue..."
+                ;;
+            [rR])
+                show_quick_reference
+                ;;
+            0)
+                echo "Exiting..."
+                exit 0
+                ;;
+            *)
+                # For backward compatibility, also accept numeric choices directly
+                # (users who remember the old menu can type 1-10 and go straight to local)
+                if [[ "$scope_choice" =~ ^[0-9]+$ ]] && [[ "$scope_choice" -ge 1 && "$scope_choice" -le 10 ]]; then
+                    log_info "Entering local mode for operation $scope_choice..."
+                    run_local_menu "$scope_choice"
+                else
+                    log_error "Invalid choice. Use L (local), M (multi-server), S (list sites), R (reference), or 0 (exit)."
+                    sleep 1
+                fi
+                ;;
+        esac
+    done
+}
+
+run_local_menu() {
+    local initial_choice="${1:-}"
+    
+    while true; do
+        if [[ -n "$initial_choice" ]]; then
+            local choice="$initial_choice"
+            initial_choice=""  # Only use once
+        else
+            show_local_menu
+            read -r -p "Choice: " choice
+            echo ""
+        fi
         
         case "$choice" in
             [sS])
@@ -3593,6 +4700,10 @@ run_interactive_menu() {
                 fi
                 url_audit "$wp_path" "$host" "" "$deep_flag"
                 ;;
+            [bB])
+                # V1.3: Back to scope menu
+                return 0
+                ;;
             0)
                 echo "Exiting..."
                 exit 0
@@ -3600,7 +4711,7 @@ run_interactive_menu() {
             *)
                 log_error "Invalid choice. Please try again."
                 echo ""
-                echo "  Enter a number (0-10), 'S' for site list, or 'R' for quick reference."
+                echo "  Enter a number (0-10), 'S' for site list, 'R' for reference, or 'B' to go back."
                 ;;
         esac
         
@@ -3634,6 +4745,12 @@ COMMANDS:
     healthcheck <domain>            Run health diagnostics
     url-audit [--deep] <wp_path>    Audit and fix URLs (--deep scans plugin data)
 
+  MULTI-SERVER (V1.3):
+    multi-server                    Enter multi-server interactive mode
+    add-server <name> <ip> [user]   Add server to session and save profile
+    test-connection <name>          Test SSH connection to a saved server
+    server-profiles                 List saved server profiles
+
 OPTIONS:
     --dry-run                       Show what would be done
     --verbose                       Show detailed debug output
@@ -3650,6 +4767,16 @@ QUICK START FOR BEGINNERS:
 
     # Interactive mode (recommended for beginners)
     sudo $SCRIPT_NAME
+
+MULTI-SERVER QUICK START:
+    # Add a remote server
+    sudo $SCRIPT_NAME add-server web 192.168.1.10 njalshe23
+
+    # Test connection
+    sudo $SCRIPT_NAME test-connection web
+
+    # Enter multi-server mode
+    sudo $SCRIPT_NAME multi-server
 
 EXAMPLES:
     # Inventory a site (shows THE 8 FACTS)
@@ -3669,6 +4796,7 @@ EXAMPLES:
 
 CONFIGURATION:
     Config file: ~/.webdev-migrate.conf
+    Server profiles: ~/.webdev-migrate/servers/
     Default log directory: /var/log/webdev-migrate
 
 MULTISITE NOTES:
@@ -3805,6 +4933,63 @@ parse_arguments() {
                 fi
                 url_audit "$1" "${2:-localhost}" "${3:-}" "$deep_flag"
                 exit $?
+                ;;
+            multi-server)
+                # V1.3: Enter multi-server interactive mode
+                shift
+                setup_logging
+                check_requirements || exit 1
+                init_multi_server_session
+                run_multi_server_menu
+                exit $?
+                ;;
+            add-server)
+                # V1.3: Add server from CLI and save profile
+                shift
+                local srv_name="${1:-}"
+                local srv_ip="${2:-}"
+                local srv_user="${3:-$USER}"
+                
+                if [[ -z "$srv_name" || -z "$srv_ip" ]]; then
+                    log_error "Usage: $SCRIPT_NAME add-server <name> <ip> [user]"
+                    exit 1
+                fi
+                
+                # Optional proxy from flag
+                local srv_proxy=""
+                if [[ "${4:-}" == "--proxy" ]]; then
+                    srv_proxy="${5:-}"
+                fi
+                
+                save_server_profile "$srv_name" "$srv_ip" "$srv_user" "$srv_proxy" ""
+                
+                # Load and test
+                init_multi_server_session
+                load_server_profile "$srv_name" >/dev/null
+                test_server_connection "$srv_name"
+                exit $?
+                ;;
+            test-connection)
+                # V1.3: Test connection to a saved server
+                shift
+                local srv_name="${1:-}"
+                
+                if [[ -z "$srv_name" ]]; then
+                    log_error "Usage: $SCRIPT_NAME test-connection <server-name>"
+                    echo ""
+                    list_saved_profiles
+                    exit 1
+                fi
+                
+                init_multi_server_session
+                load_server_profile "$srv_name" >/dev/null || exit 1
+                test_server_connection "$srv_name"
+                exit $?
+                ;;
+            server-profiles)
+                # V1.3: List saved server profiles
+                list_saved_profiles
+                exit 0
                 ;;
             *)
                 if [[ "$1" =~ ^-- ]]; then
