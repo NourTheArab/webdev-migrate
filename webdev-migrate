@@ -66,7 +66,7 @@ CURRENT_SCOPE="local"         # "local" or "multi"
 
 # V1.4 FIX: Detect real user's SSH key when running under sudo
 # sudo changes $HOME to /root, so SSH can't find keys in the real user's home.
-# This is critical for NFS-mounted homes (e.g., /eccs/home/user/.ssh/)
+# Critical for NFS-mounted homes (e.g., /eccs/home/user/.ssh/)
 SUDO_SSH_KEY=""
 if [[ -n "${SUDO_USER:-}" ]]; then
     _sudo_real_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
@@ -81,6 +81,34 @@ if [[ -n "${SUDO_USER:-}" ]]; then
     done
     unset _sudo_real_home _key_type
 fi
+
+# V1.4 FIX: SSH ControlMaster — reuse connections to avoid re-authenticating
+# Every remote_exec/remote_copy call goes through the jumphost. Without
+# multiplexing, each call opens a new connection and asks for password.
+# ControlMaster opens one connection per server, then reuses it.
+SSH_CONTROL_DIR=$(mktemp -d /tmp/webdev-migrate-ssh-XXXXXXXX)
+chmod 700 "$SSH_CONTROL_DIR"
+
+# Build common SSH options that all commands will use
+_build_ssh_opts() {
+    local opts="-o StrictHostKeyChecking=no -o ConnectTimeout=30"
+    opts="$opts -o ControlMaster=auto"
+    opts="$opts -o ControlPath=$SSH_CONTROL_DIR/%r@%h:%p"
+    opts="$opts -o ControlPersist=600"
+    [[ -n "${SUDO_SSH_KEY:-}" ]] && opts="$opts -i $SUDO_SSH_KEY"
+    echo "$opts"
+}
+
+# Clean up control sockets on exit
+_cleanup_ssh_controls() {
+    if [[ -d "${SSH_CONTROL_DIR:-}" ]]; then
+        # Gracefully close all master connections
+        for sock in "$SSH_CONTROL_DIR"/*; do
+            [[ -S "$sock" ]] && ssh -o ControlPath="$sock" -O exit _ 2>/dev/null || true
+        done
+        rm -rf "$SSH_CONTROL_DIR" 2>/dev/null || true
+    fi
+}
 
 # Server profiles directory (V1.3)
 PROFILE_DIR="${HOME}/.webdev-migrate/servers"
@@ -227,6 +255,9 @@ cleanup_on_exit() {
     
     # Release any held locks (V1.2)
     release_lock
+    
+    # V1.4: Clean up SSH ControlMaster sockets
+    _cleanup_ssh_controls
     
     echo ""
     if [[ $exit_code -eq 0 ]]; then
@@ -1162,15 +1193,12 @@ test_server_connection() {
     
     # Check 2: SSH connectivity
     log_step "Testing SSH connection..."
-    local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
-    
-    # V1.4 FIX: Use real user's SSH key when running under sudo
-    [[ -n "${SUDO_SSH_KEY:-}" ]] && ssh_opts="$ssh_opts -i $SUDO_SSH_KEY"
+    # V1.4: Use shared SSH options (ControlMaster, sudo key) + BatchMode for test
+    local ssh_opts="$(_build_ssh_opts) -o ConnectTimeout=10 -o BatchMode=yes"
     
     # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
     local proxy_user="${SERVER_CONFIG[${server_name}.proxy_user]:-${user}}"
     if [[ -n "$proxy" ]]; then
-        # If proxy already contains '@', use as-is; otherwise prepend proxy_user
         if [[ "$proxy" == *"@"* ]]; then
             ssh_opts="$ssh_opts -J ${proxy}"
             log_info "  Using ProxyJump: $proxy"
@@ -1183,6 +1211,19 @@ test_server_connection() {
     if ssh $ssh_opts "${user}@${ip}" "echo connected" >/dev/null 2>&1; then
         log_success "✓ SSH connection successful"
         checks_passed=$((checks_passed + 1))
+        
+        # V1.4: Establish persistent ControlMaster (without BatchMode) for reuse
+        # The test above used BatchMode=yes which won't create a persistent master.
+        # Open a background master so subsequent remote_exec calls don't re-auth.
+        local master_opts="$(_build_ssh_opts)"
+        if [[ -n "$proxy" ]]; then
+            if [[ "$proxy" == *"@"* ]]; then
+                master_opts="$master_opts -J ${proxy}"
+            else
+                master_opts="$master_opts -J ${proxy_user}@${proxy}"
+            fi
+        fi
+        ssh $master_opts -fN "${user}@${ip}" 2>/dev/null || true
     else
         log_error "✗ SSH connection failed"
         echo ""
@@ -1277,10 +1318,8 @@ remote_exec() {
     
     if [[ -n "$ip" ]]; then
         # Use session-based connection
-        local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=30"
-        # V1.4 FIX: Use real user's SSH key when running under sudo
-        [[ -n "${SUDO_SSH_KEY:-}" ]] && ssh_opts="$ssh_opts -i $SUDO_SSH_KEY"
-        # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
+        # V1.4: Use shared SSH options (ControlMaster reuses connection, sudo key)
+        local ssh_opts="$(_build_ssh_opts)"
         if [[ -n "$proxy" ]]; then
             local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
             if [[ "$proxy" == *"@"* ]]; then
@@ -1296,9 +1335,8 @@ remote_exec() {
     fi
     
     # Fallback: legacy behavior (direct hostname, uses global SSH_USER)
-    local _legacy_key_opt=""
-    [[ -n "${SUDO_SSH_KEY:-}" ]] && _legacy_key_opt="-i $SUDO_SSH_KEY"
-    ssh -o StrictHostKeyChecking=no $_legacy_key_opt "${SSH_USER}@${server}" "$command"
+    local _legacy_opts="$(_build_ssh_opts)"
+    ssh $_legacy_opts "${SSH_USER}@${server}" "$command"
 }
 
 remote_copy() {
@@ -1319,9 +1357,8 @@ remote_copy() {
     local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
     
     local rsync_ssh_opts=""
-    # V1.4 FIX: Build SSH options for rsync — handle both sudo key and ProxyJump
-    local _rsync_ssh_args=""
-    [[ -n "${SUDO_SSH_KEY:-}" ]] && _rsync_ssh_args="-i $SUDO_SSH_KEY"
+    # V1.4: Build SSH options for rsync — ControlMaster, sudo key, ProxyJump
+    local _rsync_ssh_args="$(_build_ssh_opts)"
     if [[ -n "$proxy" ]]; then
         local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
         if [[ "$proxy" == *"@"* ]]; then
@@ -1330,7 +1367,7 @@ remote_copy() {
             _rsync_ssh_args="$_rsync_ssh_args -J ${proxy_user}@${proxy}"
         fi
     fi
-    [[ -n "$_rsync_ssh_args" ]] && rsync_ssh_opts="-e 'ssh $_rsync_ssh_args'"
+    rsync_ssh_opts="-e 'ssh $_rsync_ssh_args'"
     
     if [[ -n "$ip" ]]; then
         # Session-based connection
@@ -1343,12 +1380,10 @@ remote_copy() {
     fi
     
     # Fallback: legacy behavior
-    local _legacy_rsync_ssh=""
-    [[ -n "${SUDO_SSH_KEY:-}" ]] && _legacy_rsync_ssh="-e 'ssh -i $SUDO_SSH_KEY'"
     if [[ "$direction" == "to" ]]; then
-        eval "rsync -avz --progress $_legacy_rsync_ssh \"$src\" \"${SSH_USER}@${server}:${dst}\""
+        eval "rsync -avz --progress $rsync_ssh_opts \"$src\" \"${SSH_USER}@${server}:${dst}\""
     else
-        eval "rsync -avz --progress $_legacy_rsync_ssh \"${SSH_USER}@${server}:${src}\" \"$dst\""
+        eval "rsync -avz --progress $rsync_ssh_opts \"${SSH_USER}@${server}:${src}\" \"$dst\""
     fi
 }
 
