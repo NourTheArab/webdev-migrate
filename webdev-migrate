@@ -435,13 +435,31 @@ _safe_load_config() {
 mysql_safe() {
     local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
     shift 3
-    sudo mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+    # V1.4.1 FIX: Can't use process substitution with sudo (file descriptors don't cross sudo boundary)
+    # Use temp file instead
+    local _cnf_file
+    _cnf_file=$(mktemp /tmp/.webdev-mycnf-XXXXXXXX)
+    chmod 600 "$_cnf_file"
+    printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host" > "$_cnf_file"
+    sudo mysql --defaults-extra-file="$_cnf_file" "$@"
+    local _rc=$?
+    rm -f "$_cnf_file"
+    return $_rc
 }
 
 mysqldump_safe() {
     local _ms_host="$1" _ms_user="$2" _ms_pass="$3"
     shift 3
-    sudo mysqldump --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host") "$@"
+    # V1.4.1 FIX: Can't use process substitution with sudo (file descriptors don't cross sudo boundary)
+    # Use temp file instead
+    local _cnf_file
+    _cnf_file=$(mktemp /tmp/.webdev-mycnf-XXXXXXXX)
+    chmod 600 "$_cnf_file"
+    printf '[client]\nuser=%s\npassword=%s\nhost=%s\n' "$_ms_user" "$_ms_pass" "$_ms_host" > "$_cnf_file"
+    sudo mysqldump --defaults-extra-file="$_cnf_file" "$@"
+    local _rc=$?
+    rm -f "$_cnf_file"
+    return $_rc
 }
 
 # V1.4 FIX: Remote mysql credential helper
@@ -1910,7 +1928,12 @@ fi
 
 echo ""
 echo "Restoring database..."
-gunzip -c "$BACKUP_DIR/db.sql.gz" | sudo mysql --defaults-extra-file=<(printf '[client]\nuser=%s\npassword=%s\n' "$DB_USER" "$DB_PASS") "$DB_NAME"
+# Create temp credentials file (process substitution doesn't work with sudo)
+_MYSQL_CNF=$(mktemp /tmp/.webdev-mycnf-XXXXXXXX)
+chmod 600 "$_MYSQL_CNF"
+printf '[client]\nuser=%s\npassword=%s\n' "$DB_USER" "$DB_PASS" > "$_MYSQL_CNF"
+gunzip -c "$BACKUP_DIR/db.sql.gz" | sudo mysql --defaults-extra-file="$_MYSQL_CNF" "$DB_NAME"
+rm -f "$_MYSQL_CNF"
 
 echo "Restoring uploads..."
 mkdir -p "$WP_PATH/wp-content"
