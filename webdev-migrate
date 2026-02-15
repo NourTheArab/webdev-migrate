@@ -1854,7 +1854,8 @@ create_backup() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would create manifest"
     else
-        cat <<EOF > "$backup_dir/manifest.json"
+        if [[ "$host" == "localhost" ]]; then
+            cat <<EOF > "$backup_dir/manifest.json"
 {
   "backup_timestamp": "${RUN_TIMESTAMP}",
   "site_slug": "${site_slug}",
@@ -1867,6 +1868,25 @@ create_backup() {
   "created_by": "webdev-migrate v${SCRIPT_VERSION}"
 }
 EOF
+        else
+            # V1.4.1 FIX: For remote hosts, create locally then copy
+            local temp_manifest=$(mktemp)
+            cat <<EOF > "$temp_manifest"
+{
+  "backup_timestamp": "${RUN_TIMESTAMP}",
+  "site_slug": "${site_slug}",
+  "environment": "${env}",
+  "host": "${host}",
+  "wp_path": "${wp_path}",
+  "db_name": "${DB_NAME}",
+  "db_host": "${DB_HOST}",
+  "table_prefix": "${TABLE_PREFIX}",
+  "created_by": "webdev-migrate v${SCRIPT_VERSION}"
+}
+EOF
+            remote_exec "$host" "cat > $backup_dir/manifest.json" < "$temp_manifest"
+            rm "$temp_manifest"
+        fi
     fi
     
     # Create restore helper script
@@ -1874,7 +1894,8 @@ EOF
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would create restore.sh"
     else
-        cat <<'RESTORE_EOF' > "$backup_dir/restore.sh"
+        if [[ "$host" == "localhost" ]]; then
+            cat <<'RESTORE_EOF' > "$backup_dir/restore.sh"
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -1926,7 +1947,66 @@ echo "Restore complete!"
 echo "Remember to update wp-config.php with new database credentials if needed."
 echo "And run: sudo -u www-data wp --path=\"$WP_PATH\" search-replace OLD_URL NEW_URL"
 RESTORE_EOF
-        chmod +x "$backup_dir/restore.sh"
+            chmod +x "$backup_dir/restore.sh"
+        else
+            # V1.4.1 FIX: For remote hosts, create locally then copy
+            local temp_restore=$(mktemp)
+            cat <<'RESTORE_EOF' > "$temp_restore"
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== WordPress Backup Restore Helper ==="
+echo ""
+echo "This script will help you restore this backup."
+echo "It should be run on the target server where you want to restore."
+echo ""
+
+BACKUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "Backup directory: $BACKUP_DIR"
+echo ""
+
+read -p "Enter target WordPress path: " WP_PATH
+read -p "Enter target database name: " DB_NAME
+read -p "Enter database user: " DB_USER
+read -sp "Enter database password: " DB_PASS
+echo ""
+
+echo ""
+echo "Will restore to:"
+echo "  WordPress: $WP_PATH"
+echo "  Database: $DB_NAME"
+echo ""
+
+read -p "Continue? (y/N): " CONFIRM
+if [[ "$CONFIRM" != "y" ]]; then
+    echo "Cancelled."
+    exit 0
+fi
+
+echo ""
+echo "Restoring database..."
+# Use explicit credentials (simpler and works with socket auth)
+gunzip -c "$BACKUP_DIR/db.sql.gz" | sudo mysql -h localhost -u "$DB_USER" -p"$DB_PASS" "$DB_NAME"
+
+echo "Restoring uploads..."
+mkdir -p "$WP_PATH/wp-content"
+tar -xzf "$BACKUP_DIR/uploads.tar.gz" -C "$WP_PATH/wp-content/"
+
+echo "Fixing permissions..."
+chown -R www-data:www-data "$WP_PATH"
+chmod -R 755 "$WP_PATH"
+find "$WP_PATH" -type f -exec chmod 644 {} \;
+
+echo ""
+echo "Restore complete!"
+echo "Remember to update wp-config.php with new database credentials if needed."
+echo "And run: sudo -u www-data wp --path=\"$WP_PATH\" search-replace OLD_URL NEW_URL"
+RESTORE_EOF
+            remote_exec "$host" "cat > $backup_dir/restore.sh" < "$temp_restore"
+            remote_exec "$host" "chmod +x $backup_dir/restore.sh"
+            rm "$temp_restore"
+        fi
     fi
     
     # Calculate sizes
