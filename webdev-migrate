@@ -64,6 +64,24 @@ declare -A SERVER_STATUS=()   # Connection status for each server
 declare -a ACTIVE_SERVERS=()  # Array of active server names in session
 CURRENT_SCOPE="local"         # "local" or "multi"
 
+# V1.4 FIX: Detect real user's SSH key when running under sudo
+# sudo changes $HOME to /root, so SSH can't find keys in the real user's home.
+# This is critical for NFS-mounted homes (e.g., /eccs/home/user/.ssh/)
+SUDO_SSH_KEY=""
+if [[ -n "${SUDO_USER:-}" ]]; then
+    _sudo_real_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    if [[ -z "$_sudo_real_home" ]]; then
+        _sudo_real_home="/home/$SUDO_USER"
+    fi
+    for _key_type in id_rsa id_ed25519 id_ecdsa; do
+        if [[ -f "$_sudo_real_home/.ssh/$_key_type" ]]; then
+            SUDO_SSH_KEY="$_sudo_real_home/.ssh/$_key_type"
+            break
+        fi
+    done
+    unset _sudo_real_home _key_type
+fi
+
 # Server profiles directory (V1.3)
 PROFILE_DIR="${HOME}/.webdev-migrate/servers"
 mkdir -p "$PROFILE_DIR" 2>/dev/null || true
@@ -1146,6 +1164,9 @@ test_server_connection() {
     log_step "Testing SSH connection..."
     local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes"
     
+    # V1.4 FIX: Use real user's SSH key when running under sudo
+    [[ -n "${SUDO_SSH_KEY:-}" ]] && ssh_opts="$ssh_opts -i $SUDO_SSH_KEY"
+    
     # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
     local proxy_user="${SERVER_CONFIG[${server_name}.proxy_user]:-${user}}"
     if [[ -n "$proxy" ]]; then
@@ -1257,6 +1278,8 @@ remote_exec() {
     if [[ -n "$ip" ]]; then
         # Use session-based connection
         local ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=30"
+        # V1.4 FIX: Use real user's SSH key when running under sudo
+        [[ -n "${SUDO_SSH_KEY:-}" ]] && ssh_opts="$ssh_opts -i $SUDO_SSH_KEY"
         # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
         if [[ -n "$proxy" ]]; then
             local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
@@ -1273,7 +1296,9 @@ remote_exec() {
     fi
     
     # Fallback: legacy behavior (direct hostname, uses global SSH_USER)
-    ssh -o StrictHostKeyChecking=no "${SSH_USER}@${server}" "$command"
+    local _legacy_key_opt=""
+    [[ -n "${SUDO_SSH_KEY:-}" ]] && _legacy_key_opt="-i $SUDO_SSH_KEY"
+    ssh -o StrictHostKeyChecking=no $_legacy_key_opt "${SSH_USER}@${server}" "$command"
 }
 
 remote_copy() {
@@ -1294,15 +1319,18 @@ remote_copy() {
     local proxy="${SERVER_CONFIG[${server}.proxy]:-}"
     
     local rsync_ssh_opts=""
-    # V1.4 FIX: Include username in ProxyJump to avoid defaulting to root under sudo
+    # V1.4 FIX: Build SSH options for rsync — handle both sudo key and ProxyJump
+    local _rsync_ssh_args=""
+    [[ -n "${SUDO_SSH_KEY:-}" ]] && _rsync_ssh_args="-i $SUDO_SSH_KEY"
     if [[ -n "$proxy" ]]; then
         local proxy_user="${SERVER_CONFIG[${server}.proxy_user]:-${user}}"
         if [[ "$proxy" == *"@"* ]]; then
-            rsync_ssh_opts="-e 'ssh -J ${proxy}'"
+            _rsync_ssh_args="$_rsync_ssh_args -J ${proxy}"
         else
-            rsync_ssh_opts="-e 'ssh -J ${proxy_user}@${proxy}'"
+            _rsync_ssh_args="$_rsync_ssh_args -J ${proxy_user}@${proxy}"
         fi
     fi
+    [[ -n "$_rsync_ssh_args" ]] && rsync_ssh_opts="-e 'ssh $_rsync_ssh_args'"
     
     if [[ -n "$ip" ]]; then
         # Session-based connection
@@ -1315,10 +1343,12 @@ remote_copy() {
     fi
     
     # Fallback: legacy behavior
+    local _legacy_rsync_ssh=""
+    [[ -n "${SUDO_SSH_KEY:-}" ]] && _legacy_rsync_ssh="-e 'ssh -i $SUDO_SSH_KEY'"
     if [[ "$direction" == "to" ]]; then
-        rsync -avz --progress "$src" "${SSH_USER}@${server}:${dst}"
+        eval "rsync -avz --progress $_legacy_rsync_ssh \"$src\" \"${SSH_USER}@${server}:${dst}\""
     else
-        rsync -avz --progress "${SSH_USER}@${server}:${src}" "$dst"
+        eval "rsync -avz --progress $_legacy_rsync_ssh \"${SSH_USER}@${server}:${src}\" \"$dst\""
     fi
 }
 
