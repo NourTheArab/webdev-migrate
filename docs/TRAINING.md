@@ -2,7 +2,7 @@
 
 **For Beginners Who Are New to Web Development**
 
-This guide will teach you everything you need to know to use the webdev-migrate tool, even if you've never worked with WordPress or web servers before.
+This guide will teach you everything you need to know to use the webdev-migrate tool, even if you've never worked with WordPress or web servers before. I use personal examples for my Earlham College community here, but you really just need to think of them as your own servers and clusters. You got this! :))
 
 ## What You'll Learn
 
@@ -58,7 +58,7 @@ SSH is how you connect to a server. Think of it like remote desktop, but text-on
 
 **On Mac/Linux:**
 ```bash
-ssh username@web.cs.earlham.edu
+ssh username@web
 ```
 
 **On Windows:**
@@ -112,7 +112,7 @@ webdev-migrate
 
 3. When asked for domain, type:
 ```
-portfolios.cs.earlham.edu
+portfolios.cs.earlham.edu (example)
 ```
 
 4. When asked for host, press Enter (uses localhost)
