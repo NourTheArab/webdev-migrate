@@ -7,8 +7,8 @@
 ## The Core Problem
 
 Earlham's WordPress infrastructure had **knowledge trapped in people's heads**:
-- Charles (Class of 2026) knew how to migrate multisite
-- Porter knows the server network topology
+- Person X knew how to migrate multisite
+- Person Y knows the server network topology
 - Previous students attampted to create documentation and code
 
 When people left, **knowledge left with them**.
