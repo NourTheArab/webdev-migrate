@@ -199,7 +199,6 @@ That's probably **on purpose**. Read the error message — it explains why and w
 
 ### "I need to talk to a human"
 - **Tool questions:** njalshe23@earlham.edu, @NourTheArab on IG (Nour)
-- **Infrastructure:** Porter (sysadmin) / Charlie (webdev)
 - **Logs:** `/var/log/webdev-migrate/` (check these first!)
 
 ```bash
@@ -246,7 +245,7 @@ The goal was never "perfect code." The goal was "the next person doesn't suffer 
 
 Good luck! You've got this.
 
-— Nour (Class of 2027)
+— Nour (Earlham Class of 2027)
 
 ---
 
