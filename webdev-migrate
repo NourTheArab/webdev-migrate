@@ -1055,7 +1055,7 @@ load_server_profile() {
         return 1
     fi
     
-    log_step "Loading server profile: $profile_name"
+    log_step "Loading server profile: $profile_name" >&2
     
     # Source the profile (variables defined inside)
     local SERVER_NAME="" SERVER_IP="" SERVER_USER="" SERVER_PROXY="" SERVER_PROXY_USER="" SERVER_DESCRIPTION=""
@@ -1072,8 +1072,11 @@ load_server_profile() {
     SERVER_CONFIG["${SERVER_NAME}.proxy_user"]="${SERVER_PROXY_USER:-}"
     SERVER_CONFIG["${SERVER_NAME}.description"]="${SERVER_DESCRIPTION:-}"
     
-    log_success "Loaded profile: $SERVER_NAME ($SERVER_IP)"
-    echo "$SERVER_NAME"
+    log_success "Loaded profile: $SERVER_NAME ($SERVER_IP)" >&2
+    # V1.4.1 FIX: Set result via global variable, NOT echo.
+    # Callers previously used server_name=$(load_server_profile ...) which ran in a subshell,
+    # causing all SERVER_CONFIG[] changes to be lost. Now callers read LOADED_SERVER_NAME directly.
+    LOADED_SERVER_NAME="$SERVER_NAME"
 }
 
 save_server_profile() {
@@ -4817,24 +4820,37 @@ migrate_wizard_multi() {
     
     # V1.3 SAFETY: Optional rollback backup of destination
     if remote_exec "$dst_server" "test -d $dst_wp_path" 2>/dev/null; then
-        local create_rollback
-        read -r -p "Destination exists. Create rollback backup before overwriting? (Y/n): " create_rollback
-        create_rollback="${create_rollback:-y}"
+        # V1.4.1 FIX: Check if destination is actually a valid WP install before attempting rollback
+        # An empty/partial directory doesn't need a backup — it's safe to overwrite
+        local _dst_has_wp=false
+        if [[ "$dst_server" == "localhost" ]]; then
+            [[ -f "$dst_wp_path/wp-config.php" && -d "$dst_wp_path/wp-includes" ]] && _dst_has_wp=true
+        else
+            remote_exec "$dst_server" "test -f $dst_wp_path/wp-config.php && test -d $dst_wp_path/wp-includes" 2>/dev/null && _dst_has_wp=true
+        fi
         
-        if [[ "$create_rollback" == "y" || "$create_rollback" == "Y" ]]; then
-            local dst_slug
-            dst_slug=$(echo "$dst_domain" | sed 's/\..*$//')
-            log_step "Creating rollback backup of existing destination..."
-            if create_backup "$dst_wp_path" "${dst_slug}-rollback" "pre-migration" "$dst_server"; then
-                log_success "Rollback backup created"
-                log_info "  To rollback: restore from /srv/backups/wp/${dst_slug}-rollback/pre-migration/"
-            else
-                log_warn "Could not create rollback backup"
-                if ! confirm "Continue without rollback backup?" "n"; then
-                    log_info "Migration cancelled"
-                    return 1
+        if [[ "$_dst_has_wp" == "true" ]]; then
+            local create_rollback
+            read -r -p "Destination has an existing WordPress installation. Create rollback backup? (Y/n): " create_rollback
+            create_rollback="${create_rollback:-y}"
+            
+            if [[ "$create_rollback" == "y" || "$create_rollback" == "Y" ]]; then
+                local dst_slug
+                dst_slug=$(echo "$dst_domain" | sed 's/\..*$//')
+                log_step "Creating rollback backup of existing destination..."
+                if create_backup "$dst_wp_path" "${dst_slug}-rollback" "pre-migration" "$dst_server"; then
+                    log_success "Rollback backup created"
+                    log_info "  To rollback: restore from /srv/backups/wp/${dst_slug}-rollback/pre-migration/"
+                else
+                    log_warn "Could not create rollback backup"
+                    if ! confirm "Continue without rollback backup?" "n"; then
+                        log_info "Migration cancelled"
+                        return 1
+                    fi
                 fi
             fi
+        else
+            log_info "Destination path exists but is not a WordPress installation — safe to overwrite"
         fi
     fi
     
@@ -4989,8 +5005,9 @@ setup_server_wizard() {
         1)
             local profile_name
             read -r -p "Enter profile name to load: " profile_name
-            local server_name
-            server_name=$(load_server_profile "$profile_name") || return 1
+            # V1.4.1 FIX: Call directly — NOT in $() subshell — so SERVER_CONFIG persists
+            load_server_profile "$profile_name" || return 1
+            local server_name="$LOADED_SERVER_NAME"
             
             if [[ -n "$server_name" ]]; then
                 if test_server_connection "$server_name"; then
