@@ -1840,6 +1840,61 @@ create_backup() {
         fi
     fi
     
+    # V1.4.1 FIX: Backup plugins directory (actual files, not just the JSON list)
+    # Without this, restores are missing plugin code and themes break
+    log_step "Backing up plugins directory"
+    local plugins_archive="$backup_dir/plugins.tar.gz"
+    local plugins_path="$wp_path/wp-content/plugins"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create plugins archive"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -d "$plugins_path" ]]; then
+                tar -czf "$plugins_archive" -C "$wp_path/wp-content" plugins/ || log_warn "Plugins backup had warnings"
+                local plugins_size=$(du -sh "$plugins_archive" 2>/dev/null | cut -f1)
+                log_success "Plugins backed up ($plugins_size)"
+            else
+                log_warn "Plugins directory not found, skipping"
+            fi
+        else
+            if remote_exec "$host" "test -d $plugins_path"; then
+                remote_exec "$host" "sudo tar -czf $plugins_archive -C $wp_path/wp-content plugins/" || log_warn "Plugins backup had warnings"
+                local plugins_size=$(remote_exec "$host" "du -sh $plugins_archive 2>/dev/null | cut -f1" 2>/dev/null || echo "?")
+                log_success "Plugins backed up ($plugins_size)"
+            else
+                log_warn "Plugins directory not found, skipping"
+            fi
+        fi
+    fi
+    
+    # V1.4.1 FIX: Backup themes directory
+    log_step "Backing up themes directory"
+    local themes_archive="$backup_dir/themes.tar.gz"
+    local themes_path="$wp_path/wp-content/themes"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would create themes archive"
+    else
+        if [[ "$host" == "localhost" ]]; then
+            if [[ -d "$themes_path" ]]; then
+                tar -czf "$themes_archive" -C "$wp_path/wp-content" themes/ || log_warn "Themes backup had warnings"
+                local themes_size=$(du -sh "$themes_archive" 2>/dev/null | cut -f1)
+                log_success "Themes backed up ($themes_size)"
+            else
+                log_warn "Themes directory not found, skipping"
+            fi
+        else
+            if remote_exec "$host" "test -d $themes_path"; then
+                remote_exec "$host" "sudo tar -czf $themes_archive -C $wp_path/wp-content themes/" || log_warn "Themes backup had warnings"
+                local themes_size=$(remote_exec "$host" "du -sh $themes_archive 2>/dev/null | cut -f1" 2>/dev/null || echo "?")
+                log_success "Themes backed up ($themes_size)"
+            else
+                log_warn "Themes directory not found, skipping"
+            fi
+        fi
+    fi
+    
     # Get plugin and theme lists
     log_step "Exporting plugin and theme lists"
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -1942,6 +1997,22 @@ echo "Restoring uploads..."
 mkdir -p "$WP_PATH/wp-content"
 tar -xzf "$BACKUP_DIR/uploads.tar.gz" -C "$WP_PATH/wp-content/"
 
+echo "Restoring plugins..."
+if [[ -f "$BACKUP_DIR/plugins.tar.gz" ]]; then
+    tar -xzf "$BACKUP_DIR/plugins.tar.gz" -C "$WP_PATH/wp-content/"
+    echo "  Plugins restored."
+else
+    echo "  WARNING: plugins.tar.gz not found — plugins may need manual install"
+fi
+
+echo "Restoring themes..."
+if [[ -f "$BACKUP_DIR/themes.tar.gz" ]]; then
+    tar -xzf "$BACKUP_DIR/themes.tar.gz" -C "$WP_PATH/wp-content/"
+    echo "  Themes restored."
+else
+    echo "  WARNING: themes.tar.gz not found — themes may need manual install"
+fi
+
 echo "Fixing permissions..."
 chown -R www-data:www-data "$WP_PATH"
 chmod -R 755 "$WP_PATH"
@@ -1998,6 +2069,22 @@ echo "Restoring uploads..."
 mkdir -p "$WP_PATH/wp-content"
 tar -xzf "$BACKUP_DIR/uploads.tar.gz" -C "$WP_PATH/wp-content/"
 
+echo "Restoring plugins..."
+if [[ -f "$BACKUP_DIR/plugins.tar.gz" ]]; then
+    tar -xzf "$BACKUP_DIR/plugins.tar.gz" -C "$WP_PATH/wp-content/"
+    echo "  Plugins restored."
+else
+    echo "  WARNING: plugins.tar.gz not found — plugins may need manual install"
+fi
+
+echo "Restoring themes..."
+if [[ -f "$BACKUP_DIR/themes.tar.gz" ]]; then
+    tar -xzf "$BACKUP_DIR/themes.tar.gz" -C "$WP_PATH/wp-content/"
+    echo "  Themes restored."
+else
+    echo "  WARNING: themes.tar.gz not found — themes may need manual install"
+fi
+
 echo "Fixing permissions..."
 chown -R www-data:www-data "$WP_PATH"
 chmod -R 755 "$WP_PATH"
@@ -2027,6 +2114,8 @@ RESTORE_EOF
     echo "Files:"
     echo "  - db.sql.gz (database dump)"
     echo "  - uploads.tar.gz (media files)"
+    echo "  - plugins.tar.gz (plugin files)"
+    echo "  - themes.tar.gz (theme files)"
     echo "  - wp-config.php (configuration)"
     echo "  - plugins-list.json"
     echo "  - themes-list.json"
@@ -2181,6 +2270,48 @@ restore_backup() {
             remote_exec "$host" "mkdir -p $target_wp_path/wp-content"
             remote_exec "$host" "tar -xzf $uploads_archive -C $target_wp_path/wp-content/" || log_warn "Uploads extraction had warnings"
             log_success "Uploads restored"
+        fi
+    fi
+    
+    # V1.4.1: Restore plugins directory
+    local plugins_archive="$backup_dir/plugins.tar.gz"
+    log_step "Restoring plugins directory"
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -f "$plugins_archive" ]]; then
+            mkdir -p "$target_wp_path/wp-content"
+            tar -xzf "$plugins_archive" -C "$target_wp_path/wp-content/" || log_warn "Plugins extraction had warnings"
+            log_success "Plugins restored"
+        else
+            log_warn "plugins.tar.gz not found in backup — plugins may need manual install"
+        fi
+    else
+        if remote_exec "$host" "test -f $plugins_archive" 2>/dev/null; then
+            remote_exec "$host" "mkdir -p $target_wp_path/wp-content"
+            remote_exec "$host" "tar -xzf $plugins_archive -C $target_wp_path/wp-content/" || log_warn "Plugins extraction had warnings"
+            log_success "Plugins restored"
+        else
+            log_warn "plugins.tar.gz not found in backup — plugins may need manual install"
+        fi
+    fi
+    
+    # V1.4.1: Restore themes directory
+    local themes_archive="$backup_dir/themes.tar.gz"
+    log_step "Restoring themes directory"
+    if [[ "$host" == "localhost" ]]; then
+        if [[ -f "$themes_archive" ]]; then
+            mkdir -p "$target_wp_path/wp-content"
+            tar -xzf "$themes_archive" -C "$target_wp_path/wp-content/" || log_warn "Themes extraction had warnings"
+            log_success "Themes restored"
+        else
+            log_warn "themes.tar.gz not found in backup — themes may need manual install"
+        fi
+    else
+        if remote_exec "$host" "test -f $themes_archive" 2>/dev/null; then
+            remote_exec "$host" "mkdir -p $target_wp_path/wp-content"
+            remote_exec "$host" "tar -xzf $themes_archive -C $target_wp_path/wp-content/" || log_warn "Themes extraction had warnings"
+            log_success "Themes restored"
+        else
+            log_warn "themes.tar.gz not found in backup — themes may need manual install"
         fi
     fi
     
