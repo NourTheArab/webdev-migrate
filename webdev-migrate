@@ -2,7 +2,7 @@
 
 #==============================================================================
 # webdev-migrate: Unified WordPress Migration & Management Tool
-# Version: 1.4.0
+# Version: 1.4.1
 # Description: Complete WordPress site management for university web teams
 #              Handles backup, restore, migration, cloning, and multisite conversions
 #             Made for Earlham College Web Dev team
@@ -16,7 +16,7 @@
 # GLOBAL CONFIGURATION
 #==============================================================================
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.1"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 START_TIME=$(date +%s)
@@ -1361,9 +1361,11 @@ remote_copy() {
     local dst="$3"
     local direction="${4:-to}"  # 'to' or 'from'
     
-    # Local copy
+    # Local copy — use rsync (not cp) for consistent trailing-slash behavior
+    # V1.4.1 FIX: cp -rp copies the directory INTO dst; rsync copies CONTENTS into dst
+    # This was causing temp dir names to appear nested inside migration-dest/
     if [[ "$server" == "localhost" ]]; then
-        cp -rp "$src" "$dst"
+        rsync -a "$src" "$dst"
         return $?
     fi
     
@@ -4370,13 +4372,46 @@ migrate_wizard_multi() {
     trap "rm -rf '$temp_dir' 2>/dev/null || true" RETURN
     
     log_info "  Downloading from $src_server..."
-    remote_copy "$src_server" "$src_backup_dir/" "$temp_dir/" "from"
+    if ! remote_copy "$src_server" "$src_backup_dir/" "$temp_dir/" "from"; then
+        log_error "Download failed from $src_server"
+        rm -rf "$temp_dir"
+        return 1
+    fi
     
-    log_info "  Uploading to $dst_server..."
-    remote_copy "$dst_server" "$temp_dir/" "$dst_backup_dir/" "to"
+    # V1.4.1: Verify download got the critical files
+    if [[ ! -f "$temp_dir/db.sql.gz" ]]; then
+        log_error "Download incomplete — db.sql.gz missing from temp dir"
+        ls -la "$temp_dir/" 2>/dev/null | head -10
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    log_info "  Downloaded: $(ls "$temp_dir/" | tr '\n' ' ')"
+    
+    log_info "  Uploading to $dst_server ($dst_backup_dir)..."
+    if ! remote_copy "$dst_server" "$temp_dir/" "$dst_backup_dir/" "to"; then
+        log_error "Upload failed to $dst_server"
+        rm -rf "$temp_dir"
+        return 1
+    fi
     
     rm -rf "$temp_dir"
-    log_success "Transfer complete"
+    
+    # V1.4.1: Verify artifacts landed on destination before declaring success
+    local _verify_cmd="test -f '$dst_backup_dir/db.sql.gz'"
+    if [[ "$dst_server" == "localhost" ]]; then
+        if ! eval "$_verify_cmd"; then
+            log_error "Transfer finished but db.sql.gz missing at $dst_backup_dir"
+            ls -la "$dst_backup_dir/" 2>/dev/null | head -10
+            return 1
+        fi
+    else
+        if ! remote_exec "$dst_server" "$_verify_cmd" 2>/dev/null; then
+            log_error "Transfer finished but db.sql.gz missing at $dst_backup_dir on $dst_server"
+            remote_exec "$dst_server" "ls -la '$dst_backup_dir/'" 2>/dev/null | head -10
+            return 1
+        fi
+    fi
+    log_success "Transfer complete — artifacts verified"
     
     # Restore on destination
     log_step "[3/5] Restoring on $dst_server..."
