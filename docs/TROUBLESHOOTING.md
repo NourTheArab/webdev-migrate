@@ -571,8 +571,7 @@ wp --version >> debug-report.txt
 ### Contact Info
 
 - **Tool questions:** njalshe23@earlham.edu (Nour)
-- **Infrastructure:** Porter (sysadmin) / Charlie (webdev)
-- **GitLab issues:** [Open an issue](https://code.cs.earlham.edu/njalshe23/webdev-migrate/-/issues)
+- **GitHub Issues:** Open an issue!
 
 **When reporting an issue, include:**
 1. What you were trying to do
