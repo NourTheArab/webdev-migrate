@@ -1736,6 +1736,9 @@ create_backup() {
     local est_total_mb=$((est_files_mb + est_db_mb))
     log_info "Estimated size: ~${est_total_mb}MB (files: ${est_files_mb}MB, database: ${est_db_mb}MB)"
     
+    # V1.4.1: Check system resources before heavy operations
+    check_system_resources "backup of $site_slug (~${est_total_mb}MB)" "$est_total_mb" || return 0
+    
     if [[ $est_total_mb -gt 1000 ]]; then
         log_warn "Large backup (>1GB). This may take several minutes."
         if ! confirm "Continue?" "y"; then
@@ -2134,6 +2137,15 @@ restore_backup() {
         echo "  Target DB: $target_db_name"
     fi
     echo ""
+    
+    # V1.4.1: Check system resources before heavy restore
+    local _restore_size_mb=0
+    if [[ "$host" == "localhost" ]]; then
+        _restore_size_mb=$(du -sm "$backup_dir" 2>/dev/null | cut -f1 || echo "0")
+    else
+        _restore_size_mb=$(remote_exec "$host" "du -sm '$backup_dir' 2>/dev/null | cut -f1" 2>/dev/null || echo "0")
+    fi
+    check_system_resources "restore to $target_wp_path (~${_restore_size_mb}MB)" "${_restore_size_mb:-0}" || return 0
     
     if ! confirm "Proceed with restore?" "n"; then
         log_info "Restore cancelled"
@@ -3884,6 +3896,364 @@ list_all_sites() {
 }
 
 #==============================================================================
+# V1.4.1 - TUI TOOLKIT (Terminal User Interface)
+#==============================================================================
+# Pure bash TUI primitives — no external dependencies (no dialog/whiptail/gum)
+# Works over SSH, handles arrow keys, falls back gracefully on dumb terminals
+
+# Terminal capabilities
+_tui_available() {
+    [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]] && [[ "$NON_INTERACTIVE" != "true" ]]
+}
+
+# Color definitions for TUI (extend existing palette)
+BG_BLUE="\033[44m"
+BG_CYAN="\033[46m"
+BG_GREEN="\033[42m"
+BG_RED="\033[41m"
+BG_YELLOW="\033[43m"
+WHITE="\033[97m"
+DIM="\033[2m"
+RESET_DIM="\033[22m"
+
+# ─────────────────────────────────────────────────────────
+# System resource monitoring
+# ─────────────────────────────────────────────────────────
+
+get_system_status() {
+    # Returns: mem_used_pct swap_used_pct disk_used_pct mem_avail_mb swap_free_mb disk_avail_gb
+    local mem_info swap_info disk_info
+
+    # Memory
+    local mem_total mem_avail mem_pct
+    mem_total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    mem_avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$mem_total" && -n "$mem_avail" && "$mem_total" -gt 0 ]]; then
+        mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+        MEM_AVAIL_MB=$(( mem_avail / 1024 ))
+    else
+        mem_pct=0; MEM_AVAIL_MB=0
+    fi
+    MEM_USED_PCT=$mem_pct
+
+    # Swap
+    local swap_total swap_free swap_pct
+    swap_total=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+    swap_free=$(awk '/^SwapFree:/{print $2}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$swap_total" && -n "$swap_free" && "$swap_total" -gt 0 ]]; then
+        swap_pct=$(( (swap_total - swap_free) * 100 / swap_total ))
+        SWAP_FREE_MB=$(( swap_free / 1024 ))
+    else
+        swap_pct=0; SWAP_FREE_MB=0
+    fi
+    SWAP_USED_PCT=$swap_pct
+
+    # Disk (root partition)
+    local disk_pct disk_avail
+    disk_pct=$(df / 2>/dev/null | awk 'NR==2{gsub(/%/,""); print $5}')
+    disk_avail=$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,""); print $4}')
+    DISK_USED_PCT=${disk_pct:-0}
+    DISK_AVAIL_GB=${disk_avail:-0}
+}
+
+# Compact status bar showing system health
+_tui_status_bar() {
+    get_system_status
+
+    local mem_color swap_color disk_color
+    [[ $MEM_USED_PCT -gt 85 ]] && mem_color="$RED" || { [[ $MEM_USED_PCT -gt 70 ]] && mem_color="$YELLOW" || mem_color="$GREEN"; }
+    [[ $SWAP_USED_PCT -gt 80 ]] && swap_color="$RED" || { [[ $SWAP_USED_PCT -gt 50 ]] && swap_color="$YELLOW" || swap_color="$GREEN"; }
+    [[ $DISK_USED_PCT -gt 90 ]] && disk_color="$RED" || { [[ $DISK_USED_PCT -gt 80 ]] && disk_color="$YELLOW" || disk_color="$GREEN"; }
+
+    local host_display
+    host_display=$(hostname -s 2>/dev/null || echo "unknown")
+
+    echo -e "${DIM}┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄${RESET_DIM}"
+    printf "  %-12s  " "$host_display"
+    printf "RAM: ${mem_color}%3d%%${NC} (%dMB free)  " "$MEM_USED_PCT" "$MEM_AVAIL_MB"
+    printf "Swap: ${swap_color}%3d%%${NC} (%dMB free)  " "$SWAP_USED_PCT" "$SWAP_FREE_MB"
+    printf "Disk: ${disk_color}%3d%%${NC} (%sGB free)" "$DISK_USED_PCT" "$DISK_AVAIL_GB"
+    echo ""
+    echo -e "${DIM}┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄${RESET_DIM}"
+}
+
+# Pre-flight resource check — call before heavy operations
+# Returns 0 if OK, 1 if user declined to proceed
+check_system_resources() {
+    local operation="${1:-operation}"
+    local estimated_mb="${2:-0}"  # Estimated size of operation in MB
+
+    get_system_status
+
+    local warnings=0
+
+    if [[ $SWAP_USED_PCT -gt 80 ]]; then
+        log_warn "Swap is ${SWAP_USED_PCT}% used (only ${SWAP_FREE_MB}MB free)"
+        warnings=$((warnings + 1))
+    fi
+
+    if [[ $MEM_AVAIL_MB -lt 256 ]]; then
+        log_warn "Very low memory: only ${MEM_AVAIL_MB}MB available"
+        warnings=$((warnings + 1))
+    fi
+
+    if [[ $estimated_mb -gt 0 && $MEM_AVAIL_MB -gt 0 ]]; then
+        if [[ $estimated_mb -gt $((MEM_AVAIL_MB * 2)) ]]; then
+            log_warn "Operation size (~${estimated_mb}MB) is much larger than available memory (${MEM_AVAIL_MB}MB)"
+            log_warn "This may cause the system to become unresponsive"
+            warnings=$((warnings + 1))
+        fi
+    fi
+
+    if [[ $DISK_USED_PCT -gt 90 ]]; then
+        log_warn "Disk is ${DISK_USED_PCT}% full (only ${DISK_AVAIL_GB}GB free)"
+        warnings=$((warnings + 1))
+    fi
+
+    if [[ $warnings -gt 0 ]]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠  System resources are low for: ${BOLD}${operation}${NC}"
+        echo -e "  ${YELLOW}   The system may become unresponsive during heavy I/O.${NC}"
+        echo ""
+        if ! confirm "Continue anyway?" "n"; then
+            log_info "Operation cancelled due to resource concerns"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Post-operation health ping — verify machine is still responsive
+check_host_alive() {
+    local host="${1:-localhost}"
+    local label="${2:-system}"
+
+    if [[ "$host" == "localhost" ]]; then
+        # Local check — can we still run basic commands?
+        if ! ls / >/dev/null 2>&1; then
+            log_warn "$label may be unresponsive"
+            return 1
+        fi
+    else
+        # Remote check
+        if ! remote_exec "$host" "echo alive" >/dev/null 2>&1; then
+            log_warn "$label ($host) is not responding — system may be overwhelmed"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────
+# Arrow-key menu selection
+# ─────────────────────────────────────────────────────────
+
+# Interactive arrow-key menu
+# Usage: tui_select RESULT_VAR "Title" "key1:Label 1" "key2:Label 2" ...
+# Sets RESULT_VAR to the key of the selected option
+# Falls back to read -p on non-interactive terminals
+tui_select() {
+    local _result_var="$1"
+    local _title="$2"
+    shift 2
+
+    local _keys=()
+    local _labels=()
+    local _descriptions=()
+
+    # Parse options — format: "key:Label" or "key:Label:description"
+    for opt in "$@"; do
+        local _key _label _desc
+        _key="${opt%%:*}"
+        local _rest="${opt#*:}"
+        _label="${_rest%%:*}"
+        _desc=""
+        if [[ "$_rest" == *":"* ]]; then
+            _desc="${_rest#*:}"
+        fi
+        _keys+=("$_key")
+        _labels+=("$_label")
+        _descriptions+=("$_desc")
+    done
+
+    local _num=${#_keys[@]}
+
+    # Fallback for non-interactive terminals
+    if ! _tui_available; then
+        echo "$_title"
+        for i in "${!_keys[@]}"; do
+            echo "  ${_keys[$i]}) ${_labels[$i]}"
+        done
+        local _fallback_choice
+        read -r -p "Choice: " _fallback_choice
+        printf -v "$_result_var" '%s' "$_fallback_choice"
+        return 0
+    fi
+
+    local _selected=0
+    local _done=false
+
+    # Hide cursor
+    printf '\033[?25l'
+    # Ensure cursor is restored on interrupt
+    trap 'printf "\033[?25h"' RETURN
+
+    while [[ "$_done" == "false" ]]; do
+        # Draw menu
+        echo ""
+        for i in "${!_keys[@]}"; do
+            if [[ $i -eq $_selected ]]; then
+                # Highlighted option
+                printf "  ${BG_CYAN}${WHITE} ▸ %-2s  %-45s ${NC}\n" "${_keys[$i]}" "${_labels[$i]}"
+                if [[ -n "${_descriptions[$i]}" ]]; then
+                    printf "         ${CYAN}%s${NC}\n" "${_descriptions[$i]}"
+                fi
+            else
+                printf "    ${DIM}%-2s${RESET_DIM}  %s\n" "${_keys[$i]}" "${_labels[$i]}"
+                if [[ -n "${_descriptions[$i]}" ]]; then
+                    printf "         ${DIM}%s${RESET_DIM}\n" "${_descriptions[$i]}"
+                fi
+            fi
+        done
+        echo ""
+        echo -e "  ${DIM}↑/↓ navigate  •  Enter select  •  or type key directly${RESET_DIM}"
+
+        # Count lines drawn for cursor repositioning
+        local _lines_drawn=$(( _num + 2 ))  # options + blank + help line
+        for i in "${!_descriptions[@]}"; do
+            [[ -n "${_descriptions[$i]}" ]] && _lines_drawn=$((_lines_drawn + 1))
+        done
+
+        # Read keypress
+        local _key_input
+        IFS= read -rsn1 _key_input
+
+        case "$_key_input" in
+            $'\x1b')
+                # Escape sequence — read arrow keys
+                local _seq
+                IFS= read -rsn2 _seq
+                case "$_seq" in
+                    '[A') [[ $_selected -gt 0 ]] && _selected=$((_selected - 1)) ;;
+                    '[B') [[ $_selected -lt $((_num - 1)) ]] && _selected=$((_selected + 1)) ;;
+                esac
+                ;;
+            '')
+                # Enter — accept current selection
+                _done=true
+                ;;
+            *)
+                # Direct key press — check if it matches an option
+                local _upper _lower
+                _upper=$(echo "$_key_input" | tr '[:lower:]' '[:upper:]')
+                _lower=$(echo "$_key_input" | tr '[:upper:]' '[:lower:]')
+                for i in "${!_keys[@]}"; do
+                    local _opt_upper=$(echo "${_keys[$i]}" | tr '[:lower:]' '[:upper:]')
+                    if [[ "$_upper" == "$_opt_upper" || "$_lower" == "$_opt_upper" ]]; then
+                        _selected=$i
+                        _done=true
+                        break
+                    fi
+                done
+                ;;
+        esac
+
+        if [[ "$_done" == "false" ]]; then
+            # Move cursor back up to redraw
+            printf "\033[${_lines_drawn}A"
+            # Clear the lines
+            for (( _cl=0; _cl<_lines_drawn; _cl++ )); do
+                printf "\033[2K\n"
+            done
+            printf "\033[${_lines_drawn}A"
+        fi
+    done
+
+    # Restore cursor
+    printf '\033[?25h'
+
+    printf -v "$_result_var" '%s' "${_keys[$_selected]}"
+    return 0
+}
+
+# Simpler yes/no TUI prompt
+tui_confirm() {
+    local _prompt="${1:-Continue?}"
+    local _default="${2:-y}"  # y or n
+    local _result
+
+    if ! _tui_available; then
+        confirm "$_prompt" "$_default"
+        return $?
+    fi
+
+    local _options=("Yes" "No")
+    local _selected=0
+    [[ "$_default" == "n" ]] && _selected=1
+
+    printf '\033[?25l'
+    trap 'printf "\033[?25h"' RETURN
+
+    local _done=false
+    while [[ "$_done" == "false" ]]; do
+        printf "\r  %s  " "$_prompt"
+        for i in 0 1; do
+            if [[ $i -eq $_selected ]]; then
+                printf "${BG_CYAN}${WHITE} %s ${NC} " "${_options[$i]}"
+            else
+                printf "${DIM} %s ${RESET_DIM} " "${_options[$i]}"
+            fi
+        done
+
+        IFS= read -rsn1 _key_input
+        case "$_key_input" in
+            $'\x1b')
+                local _seq; IFS= read -rsn2 _seq
+                case "$_seq" in
+                    '[C'|'[B') _selected=1 ;;
+                    '[D'|'[A') _selected=0 ;;
+                esac
+                ;;
+            '') _done=true ;;
+            [yY]) _selected=0; _done=true ;;
+            [nN]) _selected=1; _done=true ;;
+        esac
+    done
+
+    printf '\033[?25h'
+    echo ""
+
+    [[ $_selected -eq 0 ]] && return 0 || return 1
+}
+
+# ─────────────────────────────────────────────────────────
+# TUI display components
+# ─────────────────────────────────────────────────────────
+
+# Main header with branding + system status
+tui_header() {
+    local _subtitle="${1:-}"
+    clear
+    echo -e "${BOLD}"
+    cat <<'HEADER_ART'
+    ╦ ╦╔═╗  ╔╦╗┬┌─┐┬─┐┌─┐┌┬┐┌─┐
+    ║║║╠═╝  ║║║││ ┬├┬┘├─┤ │ ├┤
+    ╚╩╝╩    ╩ ╩┴└─┘┴└─┴ ┴ ┴ └─┘
+HEADER_ART
+    echo -ne "${NC}"
+    echo -e "    ${DIM}WordPress Migration Tool v${SCRIPT_VERSION}${RESET_DIM}"
+    echo -e "    ${DIM}Earlham College Webdev Team${RESET_DIM}"
+    if [[ -n "$_subtitle" ]]; then
+        echo ""
+        echo -e "    ${CYAN}${_subtitle}${NC}"
+    fi
+    echo ""
+    _tui_status_bar
+    echo ""
+}
+
+
+#==============================================================================
 # V1.2.1 - QUICK REFERENCE PANEL
 #==============================================================================
 
@@ -4420,6 +4790,13 @@ migrate_wizard_multi() {
         return 1
     fi
     
+    # V1.4.1: Post-restore health check — make sure destination is still responsive
+    if ! check_host_alive "$dst_server" "Destination server"; then
+        log_error "Destination server became unresponsive after restore!"
+        log_error "The system may be out of memory. Wait for it to recover, then verify."
+        return 1
+    fi
+    
     # Update URLs
     log_step "[4/5] Updating URLs..."
     local src_url="https://$src_domain"
@@ -4588,43 +4965,22 @@ setup_server_wizard() {
 #==============================================================================
 
 show_multi_server_menu() {
-    clear
-    cat <<EOF
-╔══════════════════════════════════════════════════════════════════╗
-║                   MULTI-SERVER MODE                              ║
-╚══════════════════════════════════════════════════════════════════╝
+    tui_header "Multi-Server Mode"
 
-EOF
-    
-    echo "Active servers: ${ACTIVE_SERVERS[*]}"
-    echo ""
-    
-    # Show status of each server
-    for server in "${ACTIVE_SERVERS[@]}"; do
-        local status="${SERVER_STATUS[$server]:-unknown}"
-        local desc="${SERVER_CONFIG[${server}.description]:-}"
-        if [[ "$status" == "connected" ]]; then
-            echo -e "  ${GREEN}✓${NC} $server $(if [[ -n "$desc" ]]; then echo "($desc)"; fi)"
-        else
-            echo -e "  ${YELLOW}?${NC} $server ($status)"
-        fi
-    done
-    
-    echo ""
-    echo -e "  ${BOLD}── SERVER MANAGEMENT ──${NC}"
-    echo "  A) Add server to session"
-    echo "  D) Remove server from session"
-    echo "  T) Test server connection"
-    echo "  P) View saved profiles"
-    echo ""
-    echo -e "  ${BOLD}── OPERATIONS ──${NC}"
-    echo "  1) View all sites across all servers"
-    echo "  2) Migrate site (server → server)"
-    echo "  3) Inventory a site on remote server"
-    echo "  4) Health check on remote server"
-    echo ""
-    echo "  B) Back to main menu"
-    echo "  0) Exit"
+    if [[ ${#ACTIVE_SERVERS[@]} -gt 0 ]]; then
+        echo -e "  ${BOLD}Active Servers:${NC}"
+        for server in "${ACTIVE_SERVERS[@]}"; do
+            local status="${SERVER_STATUS[$server]:-unknown}"
+            local desc="${SERVER_CONFIG[${server}.description]:-}"
+            if [[ "$status" == "connected" ]]; then
+                echo -e "    ${GREEN}●${NC} $server ${DIM}${desc}${RESET_DIM}"
+            else
+                echo -e "    ${YELLOW}○${NC} $server ${DIM}($status)${RESET_DIM}"
+            fi
+        done
+    else
+        echo -e "  ${DIM}No servers configured yet. Use 'A' to add one.${RESET_DIM}"
+    fi
     echo ""
 }
 
@@ -4636,27 +4992,37 @@ run_multi_server_menu() {
     
     while true; do
         show_multi_server_menu
+
         local choice
-        read -r -p "Choice: " choice
-        echo ""
+        tui_select choice "" \
+            "A:Add server to session" \
+            "D:Remove server from session" \
+            "T:Test server connection" \
+            "P:View saved profiles" \
+            "1:View sites across all servers" \
+            "2:Migrate site (server → server)" \
+            "3:Inventory site on remote server" \
+            "4:Health check on remote server" \
+            "B:Back to main menu" \
+            "0:Exit"
         
         case "$choice" in
-            [aA])
+            A|a)
                 setup_server_wizard
                 ;;
-            [dD])
+            D|d)
                 echo "Active servers: ${ACTIVE_SERVERS[*]}"
                 local server_name
                 read -r -p "Server to remove: " server_name
                 remove_server_from_session "$server_name"
                 ;;
-            [tT])
+            T|t)
                 echo "Active servers: ${ACTIVE_SERVERS[*]}"
                 local server_name
                 read -r -p "Server to test: " server_name
                 test_server_connection "$server_name"
                 ;;
-            [pP])
+            P|p)
                 list_saved_profiles
                 ;;
             1)
@@ -4679,11 +5045,11 @@ run_multi_server_menu() {
                 read -r -p "Domain: " domain
                 healthcheck_site "$domain" "" "$server_name"
                 ;;
-            [bB])
+            B|b)
                 return 0
                 ;;
             0)
-                echo "Exiting..."
+                echo -e "  ${DIM}Goodbye!${RESET_DIM}"
                 exit 0
                 ;;
             *)
@@ -4701,74 +5067,11 @@ run_multi_server_menu() {
 #==============================================================================
 
 show_menu() {
-    clear
-    cat <<EOF
-╔══════════════════════════════════════════════════════════════════╗
-║                                                                  ║
-║         ╦ ╦╔═╗       WEBDEV MIGRATION TOOL                       ║
-║         ║║║╠═╝       Version ${SCRIPT_VERSION}                               ║
-║         ╚╩╝╩                                                     ║
-║                   WordPress Teacher & Assistant                  ║
-║                     for Earlham's Webdev Team                    ║
-║                                                                  ║
-║                 Made with Coffee by Nour Al-Sheikh               ║
-║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-
-EOF
-    
-    echo "SCOPE SELECTION:"
-    echo ""
-    echo -e "  ${BOLD}L)${NC}  Local Server Operations"
-    echo "      Work on THIS server only (traditional mode)"
-    echo ""
-    echo -e "  ${BOLD}M)${NC}  Multi-Server Mode ${CYAN}[NEW in v1.3]${NC}"
-    echo "      Manage multiple servers, cross-server migrations"
-    echo ""
-    echo -e "  ${BOLD}── QUICK ACCESS ──${NC}"
-    echo "  S)  List sites (local server)"
-    echo "  R)  Quick Reference"
-    echo ""
-    echo "  0)  Exit"
-    echo ""
-    echo -e "  💡 ${CYAN}TIP:${NC} Most users should start with 'S' to see what's on this server"
-    echo -e "  📋 Use 'M' for cross-server migrations (requires SSH setup)"
-    echo ""
+    tui_header
 }
 
 show_local_menu() {
-    clear
-    cat <<EOF
-╔══════════════════════════════════════════════════════════════════╗
-║         LOCAL SERVER OPERATIONS - v${SCRIPT_VERSION}                         ║
-╚══════════════════════════════════════════════════════════════════╝
-
-EOF
-    
-    echo "Select an operation:"
-    echo ""
-    echo -e "  ${BOLD}── START HERE ──${NC}"
-    echo "  S)  List all sites on this server"
-    echo "  R)  Quick Reference (lookup commands)"
-    echo ""
-    echo -e "  ${BOLD}── OPERATIONS ──${NC}"
-    echo "  1)  Inventory a site (show THE 8 FACTS)"
-    echo "  2)  Backup a site"
-    echo "  3)  Restore a site from backup (with verification)"
-    echo "  4)  Migrate site: Source → Destination (full copy)"
-    echo "  5)  Clone live → test"
-    echo "  6)  Promote test → live (careful!)"
-    echo "  7)  Multisite: inspect / list subsites (LEGACY)"
-    echo "  8)  Multisite: promote subsite to standalone (RECOMMENDED)"
-    echo "  9)  Health check / troubleshooting"
-    echo "  10) URL audit and fix (use for deep plugin scan)"
-    echo ""
-    echo "  B)  Back to main menu"
-    echo "  0)  Exit"
-    echo ""
-    echo -e "  💡 ${CYAN}TIP:${NC} Open a second terminal to look things up!"
-    echo -e "  📋 Multisite is ${YELLOW}LEGACY${NC} - use option 8 to convert to standalone."
-    echo ""
+    tui_header "Local Server Operations"
 }
 
 #==============================================================================
@@ -4776,44 +5079,36 @@ EOF
 #==============================================================================
 
 run_interactive_menu() {
-    # V1.2.1: Show startup tips on first run
-    show_startup_tips
-    
-    # V1.3: Two-tier menu system
+    # V1.3: Two-tier menu system, V1.4.1: TUI arrow-key navigation
     while true; do
-        show_menu
+        tui_header
+
         local scope_choice
-        read -r -p "Choice: " scope_choice
-        echo ""
-        
+        tui_select scope_choice "Select mode:" \
+            "L:Local Server Operations:Work on THIS server only" \
+            "M:Multi-Server Mode:Cross-server migrations, remote management" \
+            "S:List Sites:Show all WordPress sites on this server" \
+            "R:Quick Reference:Lookup common commands" \
+            "0:Exit"
+
         case "$scope_choice" in
-            [lL])
-                run_local_menu
-                ;;
-            [mM])
-                run_multi_server_menu
-                ;;
-            [sS])
+            L|l) run_local_menu ;;
+            M|m) run_multi_server_menu ;;
+            S|s)
                 list_all_sites
                 echo ""
                 read -r -p "Press Enter to continue..."
                 ;;
-            [rR])
-                show_quick_reference
-                ;;
+            R|r) show_quick_reference ;;
             0)
-                echo "Exiting..."
+                echo ""
+                echo -e "  ${DIM}Goodbye!${RESET_DIM}"
+                echo ""
                 exit 0
                 ;;
             *)
-                # For backward compatibility, also accept numeric choices directly
-                # (users who remember the old menu can type 1-10 and go straight to local)
                 if [[ "$scope_choice" =~ ^[0-9]+$ ]] && [[ "$scope_choice" -ge 1 && "$scope_choice" -le 10 ]]; then
-                    log_info "Entering local mode for operation $scope_choice..."
                     run_local_menu "$scope_choice"
-                else
-                    log_error "Invalid choice. Use L (local), M (multi-server), S (list sites), R (reference), or 0 (exit)."
-                    sleep 1
                 fi
                 ;;
         esac
@@ -4826,19 +5121,32 @@ run_local_menu() {
     while true; do
         if [[ -n "$initial_choice" ]]; then
             local choice="$initial_choice"
-            initial_choice=""  # Only use once
+            initial_choice=""
         else
-            show_local_menu
-            read -r -p "Choice: " choice
-            echo ""
+            tui_header "Local Server Operations"
+
+            tui_select choice "" \
+                "S:List all sites on this server" \
+                "R:Quick Reference" \
+                "1:Inventory a site (THE 8 FACTS)" \
+                "2:Backup a site" \
+                "3:Restore from backup" \
+                "4:Migrate site (full copy)" \
+                "5:Clone live → test" \
+                "6:Promote test → live" \
+                "7:Multisite: inspect subsites" \
+                "8:Multisite → standalone" \
+                "9:Health check" \
+                "10:URL audit and fix" \
+                "B:Back to main menu" \
+                "0:Exit"
         fi
         
         case "$choice" in
-            [sS])
-                # V1.2.1: List all sites
+            S|s)
                 list_all_sites
                 ;;
-            [rR])
+            R|r)
                 # V1.2.1: Quick Reference
                 show_quick_reference
                 continue  # Skip the "Press Enter" at the end since quick_reference has its own
@@ -5011,18 +5319,15 @@ run_local_menu() {
                 fi
                 url_audit "$wp_path" "$host" "" "$deep_flag"
                 ;;
-            [bB])
-                # V1.3: Back to scope menu
+            B|b)
                 return 0
                 ;;
             0)
-                echo "Exiting..."
+                echo -e "  ${DIM}Goodbye!${RESET_DIM}"
                 exit 0
                 ;;
             *)
                 log_error "Invalid choice. Please try again."
-                echo ""
-                echo "  Enter a number (0-10), 'S' for site list, 'R' for reference, or 'B' to go back."
                 ;;
         esac
         
